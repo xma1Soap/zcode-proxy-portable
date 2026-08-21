@@ -203,4 +203,48 @@ describe("handleResponses", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("start-plan stream:true returns SSE before a slow captcha solve", async () => {
+    const startConfig: ProxyConfig = { ...CONFIG, plan: "start-plan" };
+    let solved = false;
+    const captcha = {
+      RETRY_HEADERS: { PARAM: "x-aliyun-captcha-verify-param", REGION: "x-aliyun-captcha-verify-region" },
+      invalidateCaptchaToken() {},
+      detectCaptchaChallenge() { return null; },
+      async getCaptchaToken() {
+        await Bun.sleep(60);
+        solved = true;
+        return { verifyParam: "tok-1", region: "cn" };
+      },
+    };
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"glm-5.2","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+    const fetchImpl = (async (): Promise<Response> => new Response(sse, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })) as unknown as typeof fetch;
+
+    const t0 = Date.now();
+    const r = await handleResponses(makeReq({ model: "glm-5.2", input: "hi", stream: true }), {
+      config: startConfig,
+      auth,
+      fetchImpl,
+      captcha,
+      captchaKeepaliveMs: 20,
+    });
+    expect(Date.now() - t0).toBeLessThan(60);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toBe("text/event-stream");
+    const text = await r.text();
+    expect(solved).toBe(true);
+    expect(text).toContain(": keepalive");
+    expect(text).toContain("event: response.created");
+    expect(text).toContain("event: response.completed");
+  });
 });

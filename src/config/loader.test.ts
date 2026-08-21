@@ -70,7 +70,7 @@ auth:
   apiKey: "abc"
 `);
     const cfg = loadConfig(path);
-    expect(cfg.server.port).toBe(8080);
+    expect(cfg.server.port).toBe(10100);
     expect(cfg.server.host).toBe("0.0.0.0");
     expect(cfg.provider).toBe("zai");
     expect(cfg.defaultModel).toBe("glm-4.6");

@@ -20,7 +20,7 @@ glm-proxy stop --all
 
 ```bash
 # one-shot, no global install
-npx --yes github:xma1Soap/zcode-proxy-portable#glm-proxy start 10010
+npx --yes github:xma1Soap/zcode-proxy-portable#glm-proxy start 10100
 ```
 
 ```bash
@@ -29,7 +29,7 @@ npm install github:xma1Soap/zcode-proxy-portable#glm-proxy
 npx glm-proxy start 8082
 ```
 
-First `start` downloads the Linux prebuild from release `v2` into `~/.glm-proxy-coexist/`.  
+First `start` downloads the Linux prebuild from release `v3` into `~/.glm-proxy-coexist/`.  
 WebUI: `http://127.0.0.1:<port>/webui`
 
 ```bash
@@ -46,5 +46,5 @@ Needs [Bun](https://bun.sh).
 git clone -b glm-proxy https://github.com/xma1Soap/zcode-proxy-portable.git
 cd zcode-proxy-portable
 bun install
-bash start.sh 10010
+bash start.sh 10100
 ```

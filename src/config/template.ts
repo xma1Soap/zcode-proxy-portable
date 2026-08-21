@@ -8,7 +8,7 @@
  */
 
 export const EXAMPLE_CONFIG_YAML: string = `server:
-  port: 8080
+  port: 10100
   host: "0.0.0.0"
 
 auth:

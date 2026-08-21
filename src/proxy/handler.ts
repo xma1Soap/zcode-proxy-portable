@@ -23,7 +23,8 @@ import { gzipSync } from "node:zlib";
 // captcha.ts is loaded only on the start-plan path (Edge + CDP, no jsdom).
 type CaptchaModule = typeof import("./captcha.js");
 let captchaModule: CaptchaModule | null = null;
-async function loadCaptcha(): Promise<CaptchaModule> {
+async function loadCaptcha(override?: CaptchaClient): Promise<CaptchaClient> {
+  if (override) return override;
   if (!captchaModule) captchaModule = await import("./captcha.js");
   return captchaModule;
 }
@@ -33,6 +34,12 @@ import { anthropicSseToOpenaiSse, openaiSseToAnthropicSse } from "../translator/
 import type { OpenAIChatRequest, OpenAIChatResponse, AnthropicMessagesRequest, AnthropicMessagesResponse } from "../translator/types.js";
 import { dumpPhase, dumpHeaders, dumpBody, dumpEnabled } from "./dump.js";
 import { recordRequest } from "./runtime-status.js";
+import {
+  captchaKeepaliveIntervalMs,
+  captchaKeepaliveSseResponse,
+  type CaptchaClient,
+  SseTerminalError,
+} from "./captcha-keepalive.js";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -46,6 +53,21 @@ export interface ProxyHandlerOptions {
    * selected response headers. Activated by `zcode-proxy serve debug`.
    */
   debug?: boolean;
+  /** Test seam: inject a captcha client instead of launching Edge. */
+  captcha?: CaptchaClient;
+  /** Test seam / override for SSE keepalive cadence during captcha wait. */
+  captchaKeepaliveMs?: number;
+}
+
+class HandlerFailure extends Error {
+  readonly status: number;
+  readonly type: string;
+  constructor(status: number, type: string, message: string) {
+    super(message);
+    this.name = "HandlerFailure";
+    this.status = status;
+    this.type = type;
+  }
 }
 
 /**
@@ -137,101 +159,160 @@ export async function proxyRequest(
     debugLine(reqId, `body transformed (upstreamFormat=${upstreamFormat}, startPlan=${startPlan}, bytes=${transformedBody?.length ?? 0})`);
   }
 
-  let captchaHeaders: Record<string, string> | undefined;
-  if (startPlan) {
-    try {
-      const captcha = await loadCaptcha();
-      const token = await captcha.getCaptchaToken(config.identity.appVersion);
-      captchaHeaders = { [captcha.RETRY_HEADERS.PARAM]: token.verifyParam, [captcha.RETRY_HEADERS.REGION]: token.region };
-    } catch {
-      // Will solve on 403 fallback below
-    }
-  }
-
   const useOrderedTransport = shouldUseOrderedTransport(config, clientSession, hasCustomFetchImpl);
-  let upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, captchaHeaders, clientSession);
-  let upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captchaHeaders, clientSession);
+  const captchaClient = startPlan ? await loadCaptcha(opts.captcha) : null;
+  const translateMode = translateOpenAIToAnthropic || translateAnthropicToOpenAI;
 
-  if (debug) {
-    debugLine(reqId, `→ POST ${upstreamReq.url}`);
-    debugLine(reqId, `  ${formatHeaderPairs(upstreamReq.headers)}`);
-    if (transformedBody) debugLine(reqId, `  body preview: ${previewBody(transformedBody)}`);
-  }
+  const runUpstream = async (decompress: boolean): Promise<Response> => {
+    let captchaHeaders: Record<string, string> | undefined;
+    if (captchaClient) {
+      try {
+        const token = await captchaClient.getCaptchaToken(config.identity.appVersion);
+        captchaHeaders = { [captchaClient.RETRY_HEADERS.PARAM]: token.verifyParam, [captchaClient.RETRY_HEADERS.REGION]: token.region };
+      } catch {
+        // Will solve on captcha-challenge retry below.
+      }
+    }
 
-  if (dumpEnabled()) {
-    dumpPhase(reqId, "upstream_out", {
-      method: upstreamReq.method,
-      url: upstreamReq.url,
-      headers: dumpHeaders(upstreamReq.headers),
-      body: dumpBody(transformedBody),
-      upstreamFormat,
-      translateMode: translateOpenAIToAnthropic || translateAnthropicToOpenAI,
-      useOrderedTransport,
-      startPlan,
+    let upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, captchaHeaders, clientSession);
+    let upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captchaHeaders, clientSession);
+
+    if (debug) {
+      debugLine(reqId, `→ POST ${upstreamReq.url}`);
+      debugLine(reqId, `  ${formatHeaderPairs(upstreamReq.headers)}`);
+      if (transformedBody) debugLine(reqId, `  body preview: ${previewBody(transformedBody)}`);
+    }
+
+    if (dumpEnabled()) {
+      dumpPhase(reqId, "upstream_out", {
+        method: upstreamReq.method,
+        url: upstreamReq.url,
+        headers: dumpHeaders(upstreamReq.headers),
+        body: dumpBody(transformedBody),
+        upstreamFormat,
+        translateMode,
+        useOrderedTransport,
+        startPlan,
+      });
+    }
+
+    let upstreamResp: Response;
+    try {
+      upstreamResp = await sendUpstreamRequest(upstreamReq, upstreamHeaderPairs, transformedBody, decompress, useOrderedTransport, fetchImpl, clientReq.signal);
+    } catch (err) {
+      throw new HandlerFailure(502, "upstream_unreachable", (err as Error).message);
+    }
+    const headersAt = Date.now();
+
+    if (debug) {
+      debugLine(reqId, `← ${upstreamResp.status} ${upstreamResp.statusText}`);
+      debugLine(reqId, `  ${formatResponseHeaders(upstreamResp.headers)}`);
+    }
+
+    if (dumpEnabled()) {
+      dumpPhase(reqId, "upstream_in", {
+        status: upstreamResp.status,
+        statusText: upstreamResp.statusText,
+        headers: dumpHeaders(upstreamResp.headers),
+        isSSE: upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false,
+        ttfbMs: headersAt - started,
+      });
+    }
+
+    if (upstreamResp.status === 401 && startPlan) {
+      throw new HandlerFailure(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
+    }
+
+    if (captchaClient && captchaClient.detectCaptchaChallenge(upstreamResp)) {
+      if (debug) debugLine(reqId, "captcha challenge — re-solving and retrying once");
+      try { upstreamResp.body?.cancel(); } catch { /* already consumed */ }
+      console.log(`${reqId} captcha challenge, re-solving...`);
+      captchaClient.invalidateCaptchaToken();
+      try {
+        const fresh = await captchaClient.getCaptchaToken(config.identity.appVersion);
+        console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`);
+        const retryHeaders = {
+          [captchaClient.RETRY_HEADERS.PARAM]: fresh.verifyParam,
+          [captchaClient.RETRY_HEADERS.REGION]: fresh.region,
+        };
+        upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, retryHeaders, clientSession);
+        upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, retryHeaders, clientSession);
+        upstreamResp = await sendUpstreamRequest(upstreamReq, upstreamHeaderPairs, transformedBody, decompress, useOrderedTransport, fetchImpl, clientReq.signal);
+        if (debug) debugLine(reqId, `← retry ${upstreamResp.status} ${upstreamResp.statusText}`);
+      } catch (err) {
+        if (err instanceof HandlerFailure) throw err;
+        throw new HandlerFailure(503, "captcha_solver_failed", (err as Error).message);
+      }
+    }
+
+    return upstreamResp;
+  };
+
+  if (startPlan && meta.stream) {
+    return captchaKeepaliveSseResponse({
+      format,
+      intervalMs: opts.captchaKeepaliveMs ?? captchaKeepaliveIntervalMs(),
+      signal: clientReq.signal,
+      produce: async ({ signal }) => {
+        let upstreamResp: Response;
+        try {
+          upstreamResp = await runUpstream(true);
+        } catch (err) {
+          if (signal.aborted) throw err;
+          if (err instanceof HandlerFailure) {
+            if (debug) debugError(reqId, err.type, err.message);
+            printRow(reqId, format, meta, err.status, started, Date.now(), 0, 0, 0);
+            throw new SseTerminalError(err.type, err.message);
+          }
+          throw err;
+        }
+        if (signal.aborted) throw new DOMException("The operation was aborted.", "AbortError");
+
+        if (!upstreamResp.ok) {
+          const errBody = await upstreamResp.text().catch(() => "");
+          printRow(reqId, format, meta, upstreamResp.status, started, Date.now(), 0, 0, 0);
+          const trimmed = errBody.trim();
+          throw new SseTerminalError("upstream_error", trimmed.slice(0, 500) || `upstream returned ${upstreamResp.status}`);
+        }
+
+        const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
+        let body = upstreamResp.body;
+        if (!isSSE || !body) {
+          printRow(reqId, format, meta, upstreamResp.status, started, Date.now(), 0, 0, 0);
+          throw new SseTerminalError("upstream_error", "upstream did not return a stream");
+        }
+
+        const encoding = upstreamResp.headers.get("content-encoding")?.toLowerCase() ?? "";
+        if (encoding.includes("gzip")) {
+          body = body.pipeThrough(new DecompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>);
+        }
+
+        if (translateOpenAIToAnthropic) {
+          const translated = anthropicSseToOpenaiSse(body, meta.model);
+          const [clientBody, statsBody] = translated.tee();
+          observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null);
+          return clientBody;
+        }
+
+        const [clientBody, statsBody] = body.tee();
+        observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null);
+        return clientBody;
+      },
     });
   }
 
   let upstreamResp: Response;
   try {
-    upstreamResp = await sendUpstreamRequest(upstreamReq, upstreamHeaderPairs, transformedBody, translateOpenAIToAnthropic || translateAnthropicToOpenAI, useOrderedTransport, fetchImpl, clientReq.signal);
+    upstreamResp = await runUpstream(translateMode);
   } catch (err) {
-    if (debug) debugError(reqId, "upstream_unreachable", (err as Error).message);
-    printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
-    return errorResponse(502, "upstream_unreachable", (err as Error).message);
+    if (err instanceof HandlerFailure) {
+      if (debug) debugError(reqId, err.type, err.message);
+      printRow(reqId, format, meta, err.status, started, Date.now(), 0, 0, 0);
+      return errorResponse(err.status, err.type, err.message);
+    }
+    throw err;
   }
   const headersAt = Date.now();
-
-  if (debug) {
-    debugLine(reqId, `← ${upstreamResp.status} ${upstreamResp.statusText}`);
-    debugLine(reqId, `  ${formatResponseHeaders(upstreamResp.headers)}`);
-  }
-
-  if (dumpEnabled()) {
-    dumpPhase(reqId, "upstream_in", {
-      status: upstreamResp.status,
-      statusText: upstreamResp.statusText,
-      headers: dumpHeaders(upstreamResp.headers),
-      isSSE: upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false,
-      ttfbMs: headersAt - started,
-    });
-  }
-
-  if (upstreamResp.status === 401 && startPlan) {
-    if (debug) debugError(reqId, "start_plan_jwt_invalid", "JWT rejected upstream");
-    printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
-    return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
-  }
-
-  // start-plan: on explicit captcha challenge, force re-solve and retry once.
-  // `&& captcha` looks redundant but is required for TS null-narrowing.
-  const captcha = startPlan ? await loadCaptcha() : null;
-  const captchaChallenge = captcha ? captcha.detectCaptchaChallenge(upstreamResp) : null;
-  if (captchaChallenge && captcha) {
-    if (debug) debugLine(reqId, "captcha challenge — re-solving and retrying once");
-    try { upstreamResp.body?.cancel(); } catch {}
-    console.log(`${reqId} captcha challenge, re-solving...`);
-    captcha.invalidateCaptchaToken();
-    try {
-      const fresh = await captcha.getCaptchaToken(config.identity.appVersion);
-      console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`);
-      const retryHeaders = {
-        [captcha.RETRY_HEADERS.PARAM]: fresh.verifyParam,
-        [captcha.RETRY_HEADERS.REGION]: fresh.region,
-      };
-      upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, retryHeaders, clientSession);
-      upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, retryHeaders, clientSession);
-      upstreamResp = await sendUpstreamRequest(upstreamReq, upstreamHeaderPairs, transformedBody, translateOpenAIToAnthropic || translateAnthropicToOpenAI, useOrderedTransport, fetchImpl, clientReq.signal).catch((err: Error) => {
-        if (debug) debugError(reqId, "upstream_unreachable", err.message);
-        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
-        return errorResponse(502, "upstream_unreachable", err.message);
-      });
-      if (debug) debugLine(reqId, `← retry ${upstreamResp.status} ${upstreamResp.statusText}`);
-    } catch (err) {
-      if (debug) debugError(reqId, "captcha_solver_failed", (err as Error).message);
-      printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
-      return errorResponse(503, "captcha_solver_failed", (err as Error).message);
-    }
-  }
 
   const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
 

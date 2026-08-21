@@ -22,7 +22,7 @@ const ENV = {
 } as const;
 
 const DEFAULTS = {
-  PORT: 8080,
+  PORT: 10100,
   HOST: "0.0.0.0",
   PROVIDER: "zai" as const,
   PLAN: "coding-plan" as const,
@@ -252,7 +252,7 @@ function resolveNonNegativeInt(raw: unknown, fallback: number, name: string): nu
   return n;
 }
 
-/** Resolve port from raw value (YAML or env), defaulting to 8080. */
+/** Resolve port from raw value (YAML or env), defaulting to 10100. */
 function resolvePort(raw: unknown): number {
   if (raw === undefined || raw === null) return DEFAULTS.PORT;
   const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);

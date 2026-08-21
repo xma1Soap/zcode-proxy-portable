@@ -48,6 +48,12 @@ import {
 } from "../translator/responses-types.js";
 import { ResponseStore, type StoredResponse } from "../responses/store.js";
 import { errorResponse } from "./handler.js";
+import {
+  captchaKeepaliveIntervalMs,
+  captchaKeepaliveSseResponse,
+  type CaptchaClient,
+  SseTerminalError,
+} from "./captcha-keepalive.js";
 
 export interface ResponsesHandlerOptions {
   config: ProxyConfig;
@@ -58,6 +64,10 @@ export interface ResponsesHandlerOptions {
   fetchImpl?: typeof fetch;
   /** Verbose per-request diagnostics. */
   debug?: boolean;
+  /** Test seam: inject a captcha client instead of launching Edge. */
+  captcha?: CaptchaClient;
+  /** Test seam / override for SSE keepalive cadence during captcha wait. */
+  captchaKeepaliveMs?: number;
 }
 
 /** Handle POST /v1/responses. */
@@ -152,49 +162,98 @@ export async function handleResponses(
     });
   }
 
-  let captchaHeaders: Record<string, string> | undefined;
-  if (startPlan) {
-    try {
-      const captcha = await import("./captcha.js");
-      const token = await captcha.getCaptchaToken(opts.config.identity.appVersion);
-      captchaHeaders = {
-        [captcha.RETRY_HEADERS.PARAM]: token.verifyParam,
-        [captcha.RETRY_HEADERS.REGION]: token.region,
-      };
-    } catch {
-      // solve on challenge retry below, or send without if config fetch failed
-    }
-  }
+  const loadCaptcha = async (): Promise<CaptchaClient> => {
+    if (opts.captcha) return opts.captcha;
+    return import("./captcha.js");
+  };
 
-  // ── 6. POST upstream ──
-  const upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, opts.config.plan, captchaHeaders, undefined);
-  const upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, opts.config.plan, captchaHeaders, undefined);
-  if (debug) console.log(`[responses] → POST ${upstreamReq.url}`);
+  const runUpstream = async (): Promise<Response> => {
+    let captchaHeaders: Record<string, string> | undefined;
+    let captchaMod: CaptchaClient | null = null;
+    if (startPlan) {
+      try {
+        captchaMod = await loadCaptcha();
+        const token = await captchaMod.getCaptchaToken(opts.config.identity.appVersion);
+        captchaHeaders = {
+          [captchaMod.RETRY_HEADERS.PARAM]: token.verifyParam,
+          [captchaMod.RETRY_HEADERS.REGION]: token.region,
+        };
+      } catch {
+        // solve on challenge retry below, or send without if config fetch failed
+      }
+    }
+
+    const postOnce = async (headers: Record<string, string> | undefined): Promise<Response> => {
+      const upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, opts.config.plan, headers, undefined);
+      const upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, opts.config.plan, headers, undefined);
+      if (debug) console.log(`[responses] → POST ${upstreamReq.url}`);
+      return fetchImpl(upstreamReq, { method: "POST", headers: Object.fromEntries(upstreamHeaders), body: transformedBody ?? undefined, signal: clientReq.signal });
+    };
+
+    let upstreamResp: Response;
+    try {
+      upstreamResp = await postOnce(captchaHeaders);
+    } catch (err) {
+      throw new SseTerminalError("upstream_unreachable", (err as Error).message);
+    }
+
+    if (startPlan) {
+      try {
+        if (!captchaMod) captchaMod = await loadCaptcha();
+        if (captchaMod.detectCaptchaChallenge(upstreamResp)) {
+          try { upstreamResp.body?.cancel(); } catch { /* already consumed */ }
+          const fresh = await captchaMod.getCaptchaToken(opts.config.identity.appVersion);
+          const retryHeaders = {
+            [captchaMod.RETRY_HEADERS.PARAM]: fresh.verifyParam,
+            [captchaMod.RETRY_HEADERS.REGION]: fresh.region,
+          };
+          upstreamResp = await postOnce(retryHeaders);
+        }
+      } catch (err) {
+        if (err instanceof SseTerminalError) throw err;
+        throw new SseTerminalError("captcha_solver_failed", (err as Error).message);
+      }
+    }
+    return upstreamResp;
+  };
+
+  // ── 8. translate Chat → Responses (start-plan: Anthropic → Chat first) ──
+  const responseId = generateResponsesId();
+  const meta = { customToolNames, namespaceMap, hasToolSearch };
+  const streamCtx = { responseId, model: req.model, meta, request: req, input, options: opts };
+
+  if (stream && startPlan) {
+    return captchaKeepaliveSseResponse({
+      format: "responses",
+      intervalMs: opts.captchaKeepaliveMs ?? captchaKeepaliveIntervalMs(),
+      signal: clientReq.signal,
+      produce: async () => {
+        const upstreamResp = await runUpstream();
+        if (!upstreamResp.ok) {
+          const errText = await upstreamResp.text().catch(() => "");
+          throw new SseTerminalError("upstream_error", errText.slice(0, 500) || `upstream returned ${upstreamResp.status}`);
+        }
+        if (!upstreamResp.body) {
+          throw new SseTerminalError("translation_failed", "upstream returned no body for stream");
+        }
+        const openaiSse = anthropicSseToOpenaiSse(upstreamResp.body, req.model);
+        const translated = streamResponse(new Response(openaiSse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }), streamCtx);
+        if (!translated.body) throw new SseTerminalError("translation_failed", "upstream returned no body for stream");
+        return translated.body;
+      },
+    });
+  }
 
   let upstreamResp: Response;
   try {
-    upstreamResp = await fetchImpl(upstreamReq, { method: "POST", headers: Object.fromEntries(upstreamHeaders), body: transformedBody ?? undefined, signal: clientReq.signal });
+    upstreamResp = await runUpstream();
   } catch (err) {
-    return errorResponse(502, "upstream_unreachable", (err as Error).message);
-  }
-
-  if (startPlan) {
-    try {
-      const captcha = await import("./captcha.js");
-      if (captcha.detectCaptchaChallenge(upstreamResp)) {
-        try { upstreamResp.body?.cancel(); } catch {}
-        const fresh = await captcha.getCaptchaToken(opts.config.identity.appVersion);
-        const retryHeaders = {
-          [captcha.RETRY_HEADERS.PARAM]: fresh.verifyParam,
-          [captcha.RETRY_HEADERS.REGION]: fresh.region,
-        };
-        const retryPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, opts.config.plan, retryHeaders, undefined);
-        const retryReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, opts.config.plan, retryHeaders, undefined);
-        upstreamResp = await fetchImpl(retryReq, { method: "POST", headers: Object.fromEntries(retryPairs), body: transformedBody ?? undefined, signal: clientReq.signal });
-      }
-    } catch (err) {
-      return errorResponse(503, "captcha_solver_failed", (err as Error).message);
-    }
+    const type = err instanceof SseTerminalError ? err.type : "upstream_unreachable";
+    const status = type === "captcha_solver_failed" ? 503 : 502;
+    return errorResponse(status, type, (err as Error).message);
   }
 
   if (!upstreamResp.ok) {
@@ -202,22 +261,8 @@ export async function handleResponses(
     return errorResponse(upstreamResp.status, "upstream_error", errText.slice(0, 500) || `upstream returned ${upstreamResp.status}`);
   }
 
-  // ── 8. translate Chat → Responses (start-plan: Anthropic → Chat first) ──
-  const responseId = generateResponsesId();
-  const meta = { customToolNames, namespaceMap, hasToolSearch };
-
   if (stream) {
-    if (startPlan) {
-      if (!upstreamResp.body) {
-        return errorResponse(502, "translation_failed", "upstream returned no body for stream");
-      }
-      const openaiSse = anthropicSseToOpenaiSse(upstreamResp.body, req.model);
-      upstreamResp = new Response(openaiSse, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      });
-    }
-    return streamResponse(upstreamResp, { responseId, model: req.model, meta, request: req, input, options: opts });
+    return streamResponse(upstreamResp, streamCtx);
   }
 
   const rawChatResp = await upstreamResp.text();

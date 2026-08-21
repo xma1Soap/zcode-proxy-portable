@@ -35,7 +35,7 @@ export async function canListen(port: number, host: string): Promise<boolean> {
 }
 
 export async function nextListenPort(start: number, host: string, maxTries = 40): Promise<number> {
-  if (!Number.isInteger(start) || start < 1) start = 8080;
+  if (!Number.isInteger(start) || start < 1) start = 10100;
   for (let i = 0; i < maxTries; i++) {
     const port = start + i;
     if (port > 65535) break;

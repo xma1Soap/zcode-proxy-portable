@@ -120,7 +120,7 @@ if [[ -z "$PORT" ]]; then
   PORT="$(yaml_port)"
 fi
 if [[ -z "$PORT" ]]; then
-  PORT=10010
+  PORT=10100
 fi
 if ! valid_port "$PORT"; then
   echo "invalid port: $PORT" >&2
