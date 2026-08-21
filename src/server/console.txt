@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>glm-proxy</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --card: #171a21;
+      --card2: #1e232d;
+      --line: #2a3140;
+      --text: #eef1f6;
+      --muted: #8b93a7;
+      --accent: #6d8bff;
+      --accent2: #8b5cf6;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --err: #f87171;
+      --shadow: 0 18px 50px rgba(0,0,0,.35);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(1200px 500px at 10% -10%, rgba(109,139,255,.22), transparent 50%),
+        radial-gradient(900px 420px at 100% 0%, rgba(139,92,246,.16), transparent 46%),
+        var(--bg);
+      color: var(--text);
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 18px 48px; }
+    header {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      margin-bottom: 22px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      width: 40px; height: 40px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      box-shadow: var(--shadow);
+    }
+    h1 { font-size: 20px; margin: 0; letter-spacing: .02em; }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .nav { display: flex; gap: 8px; flex-wrap: wrap; }
+    button, .btn {
+      border: 1px solid var(--line); background: var(--card); color: var(--text);
+      border-radius: 10px; padding: 8px 12px; cursor: pointer; font: inherit;
+      text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+    }
+    button:hover, .btn:hover { border-color: var(--accent); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .hero {
+      display: grid; grid-template-columns: 1.3fr .7fr; gap: 14px; margin-bottom: 14px;
+    }
+    @media (max-width: 800px) { .hero { grid-template-columns: 1fr; } }
+    .card {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--line); border-radius: 16px; padding: 18px;
+      box-shadow: var(--shadow);
+    }
+    .pulse {
+      width: 10px; height: 10px; border-radius: 50%; background: var(--muted);
+      box-shadow: 0 0 0 0 rgba(52,211,153,.6);
+    }
+    .pulse.on { background: var(--ok); animation: pulse 1.8s infinite; }
+    .pulse.wait { background: var(--warn); }
+    .pulse.off { background: var(--err); }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(52,211,153,.55); }
+      70% { box-shadow: 0 0 0 10px rgba(52,211,153,0); }
+      100% { box-shadow: 0 0 0 0 rgba(52,211,153,0); }
+    }
+    .hero h2 { margin: 0 0 8px; font-size: 28px; }
+    .meta { color: var(--muted); font-size: 13px; line-height: 1.7; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+    h3 { margin: 0 0 12px; font-size: 15px; }
+    .row { display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .row:last-child { border-bottom: 0; }
+    .k { color: var(--muted); }
+    .v { text-align: right; word-break: break-all; }
+    .mono { font-family: ui-monospace, Consolas, monospace; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip { background: var(--card2); border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px; font-size: 12px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.5; }
+    .toast {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+      background: var(--card); border: 1px solid var(--line); padding: 8px 14px;
+      border-radius: 10px; opacity: 0; transition: opacity .2s; pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>glm-proxy</h1>
+          <div class="sub">可视化控制台 · 登录 / 状态 / 接入</div>
+        </div>
+      </div>
+      <div class="nav">
+        <a class="btn" id="link-manager" href="/" target="_top">多开管理</a>
+        <a class="btn primary" href="/webui">打开对话</a>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="card">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+          <span class="pulse" id="pulse"></span>
+          <span id="hero-state" class="meta">正在读取状态…</span>
+        </div>
+        <h2 id="hero-title">glm-proxy</h2>
+        <div class="meta" id="hero-line">—</div>
+        <div class="actions">
+          <button class="primary" id="btn-login-bm" type="button">登录 Bigmodel</button>
+          <button id="btn-login-zai" type="button">登录 Z.AI</button>
+          <button id="btn-import-zcode" type="button">从 ZCode 导入</button>
+          <button id="btn-export-cred" type="button">导出解密凭证</button>
+          <button id="btn-import-cred" type="button">导入解密凭证</button>
+          <input id="cred-file" type="file" accept="application/json,.json" style="display:none" />
+          <button id="btn-logout" type="button">退出登录</button>
+        </div>
+        <div class="hint" id="login-hint">OAuth 会打开授权页。从 ZCode 导入会读取本机 %USERPROFILE%\.zcode\v2\config.json 里的 start-plan JWT，写入反代自己的凭证库。</div>
+      </div>
+      <div class="card">
+        <h3>快速对话</h3>
+        <div class="meta">完整聊天在「打开对话」。这里发一条最短探测。</div>
+        <div class="actions">
+          <select id="probe-model"></select>
+          <button class="primary" id="btn-probe" type="button">测试</button>
+        </div>
+        <div class="hint mono" id="probe-out">尚未测试</div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h3>接入信息</h3>
+        <div class="row"><span class="k">OpenAI Base</span><span class="v mono" id="box-base">—</span></div>
+        <div class="row"><span class="k">Anthropic Base</span><span class="v mono" id="box-ant">—</span></div>
+        <div class="row"><span class="k">WebUI</span><span class="v mono" id="box-web">—</span></div>
+        <div class="row"><span class="k">反代 Key</span><span class="v mono" id="box-key">—</span></div>
+      </div>
+      <div class="card">
+        <h3>运行快照</h3>
+        <div class="row"><span class="k">监听</span><span class="v mono" id="box-listen">—</span></div>
+        <div class="row"><span class="k">Provider / Plan</span><span class="v" id="box-plan">—</span></div>
+        <div class="row"><span class="k">请求数</span><span class="v" id="box-reqs">—</span></div>
+        <div class="row"><span class="k">最近请求</span><span class="v" id="box-last">—</span></div>
+        <div class="row"><span class="k">运行时长</span><span class="v" id="box-up">—</span></div>
+      </div>
+      <div class="card">
+        <h3>上游账号</h3>
+        <div class="row"><span class="k">登录</span><span class="v" id="box-login">—</span></div>
+        <div class="row"><span class="k">用户</span><span class="v mono" id="box-user">—</span></div>
+        <div class="row"><span class="k">Key 预览</span><span class="v mono" id="box-upkey">—</span></div>
+        <div class="row"><span class="k">JWT</span><span class="v" id="box-jwt">—</span></div>
+      </div>
+      <div class="card">
+        <h3>模型</h3>
+        <div class="chips" id="box-models"></div>
+        <div class="hint">客户端模型名填 glm-5.3 或 glm-5-turbo。</div>
+      </div>
+    </section>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script>
+  (function () {
+    var SERVER_KEY = __ZCODE_PROXY_KEY_JSON__;
+    var toastTimer;
+    function $(id) { return document.getElementById(id); }
+    function toast(msg) {
+      $("toast").textContent = msg;
+      $("toast").classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () { $("toast").classList.remove("show"); }, 2200);
+    }
+    function origin() { return location.origin; }
+    function fmtMs(ms) {
+      if (ms == null) return "—";
+      var s = Math.floor(ms / 1000);
+      if (s < 60) return s + "s";
+      if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+      return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+    }
+    function setPulse(kind) {
+      $("pulse").className = "pulse " + (kind || "");
+    }
+    function fillModels(list) {
+      var box = $("box-models");
+      var sel = $("probe-model");
+      var keep = sel.value;
+      var ids = list || [];
+      var same = sel.options.length === ids.length;
+      if (same) {
+        for (var i = 0; i < ids.length; i++) {
+          if (sel.options[i].value !== ids[i]) { same = false; break; }
+        }
+      }
+      if (same) return;
+      box.innerHTML = "";
+      sel.innerHTML = "";
+      ids.forEach(function (id) {
+        var c = document.createElement("span");
+        c.className = "chip"; c.textContent = id; box.appendChild(c);
+        var o = document.createElement("option"); o.value = id; o.textContent = id; sel.appendChild(o);
+      });
+      if (keep && ids.indexOf(keep) >= 0) sel.value = keep;
+      else if (ids.indexOf("glm-5.3") >= 0) sel.value = "glm-5.3";
+    }
+    function renderAuth(a) {
+      if (!a) return;
+      $("box-login").textContent = a.loggedIn ? "已登录" : "未登录";
+      $("box-user").textContent = (a.account && a.account.userId) || "—";
+      $("box-upkey").textContent = (a.account && a.account.apiKeyPreview) || "—";
+      $("box-jwt").textContent = a.account && a.account.hasJwt ? "已就绪 (start-plan)" : "无";
+      $("box-plan").textContent = (a.provider || "—") + " / " + (a.plan || "—");
+      if (a.pending) {
+        setPulse("wait");
+        $("hero-state").textContent = "等待 " + a.pending.provider + " 授权完成";
+        $("hero-title").textContent = "正在登录";
+      } else if (a.loggedIn && a.live) {
+        setPulse("on");
+        $("hero-state").textContent = "服务在线 · 上游已登录";
+        $("hero-title").textContent = (a.plan || "ready");
+      } else if (a.loggedIn) {
+        setPulse("wait");
+        $("hero-state").textContent = "已有凭据，但当前模式未使用";
+        $("hero-title").textContent = a.plan || "logged in";
+      } else {
+        setPulse("off");
+        $("hero-state").textContent = "服务在线 · 尚未登录上游";
+        $("hero-title").textContent = "未登录";
+      }
+      $("login-hint").textContent = a.lastError
+        ? ("上次登录失败：" + a.lastError)
+        : "点登录会直接打开智谱 / Z.AI 授权页，不需要先填 API key。";
+    }
+    function renderStatus(s) {
+      if (!s) return;
+      $("box-listen").textContent = s.listen || (location.host);
+      $("box-reqs").textContent = String(s.requestCount ?? 0);
+      $("box-up").textContent = fmtMs(s.uptimeMs);
+      if (s.lastRequest) {
+        var lr = s.lastRequest;
+        $("box-last").textContent = lr.model + " · " + lr.status + " · " + lr.ttfbMs + "ms";
+      } else {
+        $("box-last").textContent = "还没有请求";
+      }
+      if (s.models) fillModels(s.models);
+      $("hero-line").textContent = (s.listen || location.host) + " · " + (s.provider || "") + " · " + (s.plan || "");
+    }
+    function refresh() {
+      Promise.all([
+        fetch("/auth/status").then(function (r) { return r.json(); }).catch(function () { return null; }),
+        fetch("/status").then(function (r) { return r.json(); }).catch(function () { return null; })
+      ]).then(function (pair) {
+        renderAuth(pair[0]);
+        renderStatus(pair[1]);
+      });
+    }
+    function startLogin(provider) {
+      fetch("/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider: provider })
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        if (!j.authorizeUrl) { toast((j.error && j.error.message) || "无法开始登录"); return; }
+        var w = window.open(j.authorizeUrl, "zcode-oauth", "width=520,height=760");
+        if (!w) location.href = j.authorizeUrl;
+        toast("已打开登录页");
+        refresh();
+      }).catch(function (e) { toast(String(e)); });
+    }
+    function logout() {
+      fetch("/auth/logout", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
+        .then(function () { toast("已退出"); refresh(); });
+    }
+    function importZcode() {
+      var headers = { "content-type": "application/json" };
+      if (SERVER_KEY) headers.authorization = "Bearer " + SERVER_KEY;
+      fetch("/auth/import-zcode", { method: "POST", headers: headers, body: "{}" })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (x) {
+          if (!x.ok) { toast((x.j && x.j.error && x.j.error.message) || "ZCode 导入失败"); return; }
+          toast("已从 ZCode 导入");
+          refresh();
+        })
+        .catch(function (e) { toast(String(e)); });
+    }
+    function probe() {
+      var model = $("probe-model").value || "glm-5.3";
+      $("probe-out").textContent = "请求 " + model + " …";
+      var headers = { "content-type": "application/json" };
+      if (SERVER_KEY) headers.authorization = "Bearer " + SERVER_KEY;
+      var t0 = Date.now();
+      fetch("/v1/chat/completions", {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify({
+          model: model,
+          messages: [{ role: "user", content: "Reply with exactly: ok" }],
+          max_tokens: 8,
+          stream: false
+        })
+      }).then(function (r) { return r.text().then(function (t) { return { r: r, t: t }; }); })
+        .then(function (x) {
+          var ms = Date.now() - t0;
+          try {
+            var j = JSON.parse(x.t);
+            var text = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+            $("probe-out").textContent = x.r.status + " · " + ms + "ms · " + (text || x.t.slice(0, 180));
+          } catch (e) {
+            $("probe-out").textContent = x.r.status + " · " + ms + "ms · " + x.t.slice(0, 180);
+          }
+          refresh();
+        }).catch(function (e) { $("probe-out").textContent = String(e); });
+    }
+    $("btn-login-bm").onclick = function () { startLogin("bigmodel"); };
+    $("btn-login-zai").onclick = function () { startLogin("zai"); };
+    function downloadBundle(bundle, name) {
+      var blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = name || "zcode-proxy-credential.json";
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(a.href);
+    }
+    function exportCred() {
+      var headers = { "content-type": "application/json" };
+      if (SERVER_KEY) headers.authorization = "Bearer " + SERVER_KEY;
+      fetch("/auth/export-credential", { method: "POST", headers: headers, body: "{}" })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (x) {
+          if (!x.ok || !x.j.bundle) { toast((x.j && x.j.error && x.j.error.message) || "导出失败"); return; }
+          downloadBundle(x.j.bundle, "zcode-proxy-credential.json");
+          toast("已导出解密凭证");
+        })
+        .catch(function (e) { toast(String(e)); });
+    }
+    function importCredFile() { $("cred-file").click(); }
+    $("cred-file").onchange = function () {
+      var f = this.files && this.files[0];
+      this.value = "";
+      if (!f) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        var parsed;
+        try { parsed = JSON.parse(String(reader.result || "")); }
+        catch (e) { toast("JSON 无效"); return; }
+        var headers = { "content-type": "application/json" };
+        if (SERVER_KEY) headers.authorization = "Bearer " + SERVER_KEY;
+        fetch("/auth/import-credential", {
+          method: "POST",
+          headers: headers,
+          body: JSON.stringify({ bundle: parsed })
+        }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+          .then(function (x) {
+            if (!x.ok) { toast((x.j && x.j.error && x.j.error.message) || "导入失败"); return; }
+            toast("已导入解密凭证");
+            refresh();
+          }).catch(function (e) { toast(String(e)); });
+      };
+      reader.readAsText(f);
+    };
+    $("btn-import-zcode").onclick = importZcode;
+    $("btn-export-cred").onclick = exportCred;
+    $("btn-import-cred").onclick = importCredFile;
+    $("btn-logout").onclick = logout;
+    $("btn-probe").onclick = probe;
+    $("box-base").textContent = origin() + "/v1";
+    $("box-ant").textContent = origin();
+    $("box-web").textContent = origin() + "/webui";
+    $("box-key").textContent = SERVER_KEY ? (SERVER_KEY.slice(0, 6) + "…" + SERVER_KEY.slice(-4)) : "(未设置)";
+    if (window !== window.top) {
+      var mgr = $("link-manager");
+      if (mgr) mgr.style.display = "none";
+    }
+    window.addEventListener("message", function (ev) {
+      if (ev.data && ev.data.__zcodeOauth === true) { toast(ev.data.ok ? "登录成功" : "登录失败"); refresh(); }
+    });
+    refresh();
+    setInterval(refresh, 3000);
+  })();
+  </script>
+</body>
+</html>

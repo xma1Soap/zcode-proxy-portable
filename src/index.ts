@@ -1,0 +1,495 @@
+/**
+ * Entry point — load config, create auth manager, start proxy server.
+ * @see .omo/plans/zcode-proxy.md Task 7
+ */
+import { loadConfig } from "./config/loader.js";
+import { EXAMPLE_CONFIG_YAML } from "./config/template.js";
+import { AuthManager } from "./auth/manager.js";
+import { startServer, type ProxyServer } from "./server/server.js";
+import { startControlListener, LogBuffer, type ControlState } from "./android/control.js";
+import { ResponseStore } from "./responses/store.js";
+import { loadCredential, saveCredential, clearCredential, getStorePath } from "./auth/store.js";
+import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
+import { KeyResolver } from "./auth/resolver.js";
+import type { Credential } from "./auth/types.js";
+import type { ProviderId } from "./provider/types.js";
+import { importFromZCodeConfig } from "./auth/zcode-import.js";
+import type { ProxyConfig } from "./config/types.js";
+import { parse, stringify } from "yaml";
+import { spawn } from "node:child_process";
+import { openSystemBrowser } from "./proxy/browser-launch.js";
+import { isAddrInUse, nextListenPort, probeLocalProxy } from "./server/listen.js";
+import { mkdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+
+const VERSION = "2.6.0";
+
+if (require.main === module) main();
+
+export interface ServeArgs {
+  configPath?: string;
+  debug: boolean;
+}
+
+/**
+ * Parse `serve` subcommand arguments. The token `debug` toggles debug mode;
+ * any other token is treated as the config path. Order-independent:
+ *   []                → { debug: false }
+ *   ["debug"]         → { debug: true }
+ *   ["my.yaml"]       → { configPath: "my.yaml", debug: false }
+ *   ["debug","x.yaml"] → { configPath: "x.yaml", debug: true }
+ *   ["x.yaml","debug"] → { configPath: "x.yaml", debug: true }
+ */
+export function parseServeArgs(args: string[]): ServeArgs {
+  const debug = args.includes("debug");
+  const configPath = args.find((a) => a !== "debug");
+  return { configPath, debug };
+}
+
+export function main(): void {
+  // `bun build --compile` exits on any uncaught exception. Log and keep the
+  // listener up; do not treat this as a license to ignore application errors.
+  process.on("uncaughtException", (err) => {
+    process.stderr.write(`[guard] uncaughtException: ${(err as Error)?.stack ?? String(err)}\n`);
+  });
+  process.on("unhandledRejection", (reason) => {
+    process.stderr.write(`[guard] unhandledRejection: ${String(reason)}\n`);
+  });
+  adoptExeDirectory();
+  try {
+    runCli();
+  } catch (err) {
+    process.stderr.write(`zcode-proxy: uncaught error: ${(err as Error).stack ?? String(err)}\n`);
+    process.exit(1);
+  }
+}
+
+/** Compiled Windows exe: always run from the folder that contains config.yaml. */
+function adoptExeDirectory(): void {
+  const exe = process.execPath;
+  if (!/\.exe$/i.test(exe)) return;
+  const lower = exe.replaceAll("\\", "/").toLowerCase();
+  if (lower.endsWith("/bun.exe") || lower.endsWith("/node.exe")) return;
+  try { process.chdir(dirname(exe)); } catch { /* keep cwd */ }
+}
+
+function shouldOpenBrowser(): boolean {
+  return process.env.ZCODE_PROXY_NO_OPEN !== "1";
+}
+
+function hubPortFile(): string {
+  return join("run", "hub.port");
+}
+
+function readRememberedPort(): number | null {
+  try {
+    if (!existsSync(hubPortFile())) return null;
+    const n = Number(readFileSync(hubPortFile(), "utf-8").trim());
+    return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberPort(port: number): void {
+  try {
+    mkdirSync("run", { recursive: true });
+    writeFileSync(hubPortFile(), `${port}\n`);
+  } catch { /* */ }
+}
+
+function openLocalUi(port: number): void {
+  const url = `http://127.0.0.1:${port}/`;
+  console.log(`opening ${url}`);
+  try { openSystemBrowser(url, spawn); } catch (err) {
+    console.error(`could not open browser: ${(err as Error).message}`);
+  }
+}
+
+async function holdThenExit(message: string, code = 1): Promise<never> {
+  process.stderr.write(message.endsWith("\n") ? message : `${message}\n`);
+  try {
+    mkdirSync("run", { recursive: true });
+    writeFileSync(join("run", "start-error.log"), message.endsWith("\n") ? message : `${message}\n`);
+  } catch { /* */ }
+  if (process.platform === "win32") {
+    process.stderr.write("This window will stay open 20 seconds so the error is readable.\n");
+    await new Promise((resolve) => setTimeout(resolve, 20_000));
+  }
+  process.exit(code);
+}
+
+function runCli(): void {
+  const args = process.argv.slice(2);
+  const cmd = args[0] ?? "serve";
+
+  if (cmd === "auth") {
+    authCommand(args.slice(1));
+  } else if (cmd === "android") {
+    runAndroid();
+  } else if (cmd === "serve" || cmd.endsWith(".yaml") || cmd.endsWith(".yml")) {
+    const serveArgs = cmd === "serve"
+      ? parseServeArgs(args.slice(1))
+      : parseServeArgs(args);
+    void serve(serveArgs.configPath, serveArgs.debug).catch((err) => {
+      void holdThenExit(`zcode-proxy failed to start: ${(err as Error).stack ?? String(err)}\n`);
+    });
+  } else if (cmd === "version" || cmd === "--version" || cmd === "-v") {
+    console.log(`zcode-proxy ${VERSION}`);
+  } else if (cmd === "help" || cmd === "--help" || cmd === "-h") {
+    printHelp();
+  } else {
+    console.error(`Unknown command: ${cmd}\n`);
+    printHelp();
+    process.exit(1);
+  }
+}
+
+function printHelp(): void {
+  console.log(`zcode-proxy ${VERSION}
+
+Usage:
+  zcode-proxy serve [config.yaml]   Start the proxy server (default)
+  zcode-proxy serve debug [config.yaml]
+                                    Start with verbose per-request diagnostics
+  zcode-proxy android               Android entry: proxy + localhost control listener
+  zcode-proxy auth login <provider> Login via OAuth (provider: zai | bigmodel)
+                                    Or open /webui and use Log in — no ZCode app required
+  zcode-proxy auth login <provider> --import
+                                    Import API key from ~/.zcode/v2/config.json
+  zcode-proxy auth logout           Clear stored credentials
+  zcode-proxy auth status           Show current authentication state
+  zcode-proxy version               Show version
+  zcode-proxy help                  Show this help
+
+Examples:
+  zcode-proxy                       Start server with default config.yaml
+  zcode-proxy serve debug           Start with extra debug logging
+  zcode-proxy auth login bigmodel   OAuth login for Bigmodel
+  zcode-proxy auth login bigmodel --import
+                                    Import existing key from ZCode config
+  zcode-proxy auth status           Check if logged in
+`);
+}
+
+async function serve(configPath: string | undefined, debug: boolean): Promise<void> {
+  const path = configPath ?? process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
+  if (!existsSync(path)) {
+    writeFileSync(path, EXAMPLE_CONFIG_YAML, "utf-8");
+    console.log(`Created ${path} from bundled template.`);
+    console.log(`Edit auth.apiKey, or run: zcode-proxy auth login <zai|bigmodel>\n`);
+  }
+  const config = loadConfig(path);
+
+  const auth = new AuthManager({
+    mode: config.auth.mode,
+    provider: config.provider,
+    apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
+  });
+
+  if (config.auth.mode === "oauth") {
+    const cred = await loadCredential();
+    if (cred) {
+      auth.setOAuthCredential(cred);
+    } else {
+      console.log(`Not logged in. Open /webui and click Log in, or run: zcode-proxy auth login ${config.provider}`);
+    }
+  }
+
+  if (debug) printDebugBanner(config, path);
+
+  let server: ProxyServer;
+  try {
+    server = await startServer(buildServerOptions(config, auth, debug));
+  } catch (err) {
+    if (!isAddrInUse(err)) throw err;
+    const want = config.server.port;
+    const remembered = readRememberedPort();
+    const existing = (await probeLocalProxy(want))
+      ? want
+      : (remembered && await probeLocalProxy(remembered) ? remembered : null);
+    if (existing != null) {
+      console.log(`already running on :${existing}`);
+      if (shouldOpenBrowser()) openLocalUi(existing);
+      return;
+    }
+    const next = await nextListenPort(want + 1, config.server.host);
+    console.warn(`port ${want} is occupied and not responding; switching to ${next}`);
+    config.server.port = next;
+    process.env.ZCODE_PROXY_PORT = String(next);
+    server = await startServer(buildServerOptions(config, auth, debug));
+  }
+  const url = `http://${server.hostname}:${server.port}`;
+  console.log(`zcode-proxy listening on ${url}`);
+  console.log(`  ui: http://127.0.0.1:${server.port}/`);
+  console.log(`  provider: ${config.provider}`);
+  console.log(`  plan: ${config.plan}`);
+  console.log(`  auth mode: ${config.auth.mode}`);
+  console.log(`  models: ${config.models.length} available`);
+  if (config.responses.enabled) console.log(`  /v1/responses: ON`);
+  if (debug) console.log(`  debug: ON`);
+  rememberPort(server.port);
+  if (shouldOpenBrowser()) openLocalUi(server.port);
+
+  const shutdown = () => {
+    console.log("\nShutting down...");
+    void shutdownCaptcha().finally(() => server.stop(true));
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+async function shutdownCaptcha(): Promise<void> {
+  try {
+    const captcha = await import("./proxy/captcha.js");
+    await captcha.destroyCaptchaSession();
+  } catch { /* no session */ }
+}
+
+/** Build `startServer` options, wiring the Responses store and MCP pool when their config gates are on. */
+function buildServerOptions(config: ProxyConfig, auth: AuthManager, debug: boolean): { config: ProxyConfig; auth: AuthManager; debug: boolean; responseStore?: ResponseStore } {
+  const opts: { config: ProxyConfig; auth: AuthManager; debug: boolean; responseStore?: ResponseStore } = { config, auth, debug };
+  if (config.responses.enabled) {
+    opts.responseStore = new ResponseStore({ maxEntries: config.responses.storeMaxEntries, ttlMs: config.responses.storeTtlMs });
+  }
+  return opts;
+}
+
+/**
+ * Android entry — starts the proxy plus a localhost control listener.
+ * Caller (Kotlin shell) must set env: ZCODE_CONTROL_PORT (control listener),
+ * ZCODE_OAUTH_CALLBACK_PORT (fixed OAuth callback port for WebView redirect).
+ */
+async function runAndroid(): Promise<void> {
+  const path = process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
+  if (!existsSync(path)) {
+    writeFileSync(path, EXAMPLE_CONFIG_YAML, "utf-8");
+  }
+  const config = loadConfig(path);
+
+  const logBuffer = new LogBuffer();
+  const origLog = console.log;
+  const origErr = console.error;
+  const origWarn = console.warn;
+  console.log = (...args: unknown[]) => { logBuffer.push(args.join(" ")); origLog(...args); };
+  console.error = (...args: unknown[]) => { logBuffer.push("[error] " + args.join(" ")); origErr(...args); };
+  console.warn = (...args: unknown[]) => { logBuffer.push("[warn] " + args.join(" ")); origWarn(...args); };
+
+  let auth = new AuthManager({
+    mode: config.auth.mode,
+    provider: config.provider,
+    apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
+  });
+
+  const serverRef: { current: ProxyServer | null } = { current: null };
+
+  async function startProxy(): Promise<{ ok: true; port: number } | { ok: false; error: string }> {
+    if (serverRef.current) return { ok: false, error: "already_running" };
+    if (config.auth.mode === "oauth") {
+      const cred = await loadCredential().catch(() => null);
+      if (!cred) return { ok: false, error: "not_logged_in" };
+      auth.setOAuthCredential(cred);
+    }
+    try {
+      const s = await startServer(buildServerOptions(config, auth, false));
+      serverRef.current = s;
+      console.log(`zcode-proxy listening on http://${s.hostname}:${s.port}`);
+      return { ok: true, port: s.port };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  async function stopProxy(): Promise<{ ok: true } | { ok: false; error: string }> {
+    const s = serverRef.current;
+    if (!s) return { ok: false, error: "not_running" };
+    try {
+      s.stop(false);
+      serverRef.current = null;
+      console.log("zcode-proxy stopped");
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  async function setConfig(changes: {
+    provider?: ProviderId;
+    plan?: "coding-plan" | "start-plan";
+  }): Promise<{ ok: true; provider: ProviderId; plan: "coding-plan" | "start-plan" } | { ok: false; error: string }> {
+    if (serverRef.current) return { ok: false, error: "stop_proxy_first" };
+    if (changes.provider) config.provider = changes.provider;
+    if (changes.plan) config.plan = changes.plan;
+    auth = new AuthManager({
+      mode: config.auth.mode,
+      provider: config.provider,
+      apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
+    });
+    updateConfigYaml(path, { provider: config.provider, plan: config.plan });
+    console.log(`config updated: provider=${config.provider} plan=${config.plan}`);
+    return { ok: true, provider: config.provider, plan: config.plan };
+  }
+
+  console.log("control listener ready; proxy stopped — use startProxy command to start");
+
+  const controlPort = Number(process.env.ZCODE_CONTROL_PORT ?? 0) || 0;
+  const controlState: ControlState = {
+    provider: config.provider,
+    plan: config.plan,
+    proxyPort: serverRef.current?.port ?? 0,
+  };
+  const controlListener = await startControlListener({
+    port: controlPort,
+    state: controlState,
+    logBuffer,
+    onStartProxy: startProxy,
+    onStopProxy: stopProxy,
+    onSetConfig: setConfig,
+    onShutdown: async () => {
+      serverRef.current?.stop(true);
+    },
+  });
+
+  console.log(`control listener: 127.0.0.1:${controlPort}`);
+  console.log(`provider: ${config.provider}`);
+  console.log(`plan: ${config.plan}`);
+
+  const shutdownAndroid = () => {
+    void shutdownCaptcha()
+      .then(() => controlListener.close())
+      .then(() => serverRef.current?.stop(true));
+  };
+  process.on("SIGINT", shutdownAndroid);
+  process.on("SIGTERM", shutdownAndroid);
+}
+
+/** Targeted YAML update of top-level `provider` and `plan` keys. */
+function updateConfigYaml(path: string, fields: { provider: ProviderId; plan: "coding-plan" | "start-plan" }): void {
+  const raw = readFileSync(path, "utf-8");
+  const parsed = parse(raw) ?? {};
+  parsed.provider = fields.provider;
+  parsed.plan = fields.plan;
+  writeFileSync(path, stringify(parsed), "utf-8");
+}
+
+function printDebugBanner(config: ProxyConfig, path: string): void {
+  const cred = config.providers[config.provider].credential ?? config.auth.apiKey;
+  const credShape = cred ? `${cred.slice(0, 6)}...${cred.slice(-4)} (${cred.length} chars)` : "(none — oauth)";
+  const active = config.providers[config.provider];
+  console.log("=== zcode-proxy DEBUG MODE ===");
+  console.log(`  config file: ${path}`);
+  console.log(`  server: ${config.server.host}:${config.server.port}`);
+  console.log(`  proxy api key: ${config.auth.proxyApiKey ? "required" : "open (no client auth)"}`);
+  console.log(`  provider: ${config.provider}`);
+  console.log(`  plan: ${config.plan}`);
+  console.log(`  identity: appVersion=${config.identity.appVersion} sourceTitle=${config.identity.sourceTitle} referer=${config.identity.refererOrigin}`);
+  console.log(`  client identity: mode=${config.clientIdentity.mode} ttl=${config.clientIdentity.ttlSeconds}s max=${config.clientIdentity.maxSessions}`);
+  console.log(`  anthropic base: ${active.anthropicBase}`);
+  console.log(`  openai base:    ${active.openaiBase}`);
+  console.log(`  credential: ${credShape}`);
+  console.log(`  models (${config.models.length}): ${config.models.join(", ")}`);
+  console.log(`  log level: ${config.logging.level}`);
+  console.log("===============================");
+}
+
+function authCommand(args: string[]): void {
+  const sub = args[0];
+
+  if (sub === "login") {
+    authLogin(args.slice(1));
+  } else if (sub === "logout") {
+    authLogout();
+  } else if (sub === "status") {
+    authStatus();
+  } else {
+    console.error("Usage: zcode-proxy auth <login|logout|status>");
+    process.exit(1);
+  }
+}
+
+async function authLogin(args: string[]): Promise<void> {
+  const provider = args[0] as ProviderId | undefined;
+  const importMode = args.includes("--import");
+
+  if (!provider || (provider !== "zai" && provider !== "bigmodel")) {
+    console.error("Usage: zcode-proxy auth login <zai|bigmodel> [--import]");
+    process.exit(1);
+  }
+
+  console.log(`Logging in: ${provider}${importMode ? " (import)" : " (OAuth)"}\n`);
+
+  let cred: Credential;
+
+  if (importMode) {
+    try {
+      cred = importFromZCodeConfig(provider);
+      console.log(`Imported from ${join(homedir(), ".zcode", "v2", "config.json")}`);
+      if (cred.jwt) console.log(`  Start-plan JWT: ${cred.jwt.slice(0, 12)}...`);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+  } else {
+    const { accessToken, userId, jwt } = await runOAuth(provider);
+    console.log("\nResolving API key...");
+    const resolver = new KeyResolver();
+    cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId);
+    if (jwt) cred.jwt = jwt;
+  }
+
+  await saveCredential(cred);
+  console.log(`\nLogged in as ${provider}.`);
+  console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
+  if (cred.userId) console.log(`  User ID: ${cred.userId}`);
+  console.log(`  Stored:  ${getStorePath()}`);
+}
+
+function authLogout(): void {
+  if (!existsSync(getStorePath())) {
+    console.log("Not logged in.");
+    return;
+  }
+  clearCredential();
+  console.log("Logged out. Credentials removed.");
+}
+
+async function authStatus(): Promise<void> {
+  const cred = await loadCredential();
+  if (!cred) {
+    console.log("Not logged in.");
+    console.log("Run: zcode-proxy auth login <zai|bigmodel>");
+    return;
+  }
+  console.log(`Logged in: ${cred.provider}`);
+  console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
+  console.log(`  Store:   ${getStorePath()}`);
+}
+
+async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; userId?: string; jwt?: string }> {
+  if (provider === "bigmodel") {
+    const oauth = new BigmodelOAuthClient();
+    const result = await oauth.authorize((url) => {
+      console.log("Open this URL to authorize:\n");
+      console.log(`  ${url}\n`);
+      console.log("Waiting for authorization... (expires in 300s)\n");
+      openBrowser(url);
+    });
+    return { accessToken: result.accessToken, userId: result.userId, jwt: result.jwt };
+  }
+
+  const oauth = new ZaiOAuthClient();
+  const result = await oauth.authorize((url) => {
+    console.log("Open this URL to authorize:\n");
+    console.log(`  ${url}\n`);
+    console.log("Waiting for authorization... (expires in 300s)\n");
+    openBrowser(url);
+  });
+  return { accessToken: result.accessToken, userId: result.userId, jwt: result.jwt };
+}
+
+function openBrowser(url: string): void {
+  try {
+    openSystemBrowser(url, spawn);
+  } catch { /* user copies URL manually */ }
+}

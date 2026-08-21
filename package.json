@@ -1,0 +1,48 @@
+{
+  "name": "glm-proxy-coexist",
+  "version": "1.1.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "nothing",
+  "bin": {
+    "glm-proxy": "bin/glm-proxy.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "start.sh",
+    "stop.sh",
+    "config.example.yaml",
+    "LICENSE",
+    "tsconfig.json",
+    "bun.lock"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xma1Soap/zcode-proxy-portable.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xma1Soap/zcode-proxy-portable/issues"
+  },
+  "homepage": "https://github.com/xma1Soap/zcode-proxy-portable/tree/glm-proxy",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "start": "node bin/glm-proxy.mjs start",
+    "test": "bun test",
+    "build": "bun build --compile --define \"require.resolve=undefined\" src/index.ts --outfile zcode-proxy.exe",
+    "build:linux-x64": "bun build --compile --target bun-linux-x64 --define \"require.resolve=undefined\" src/index.ts --outfile zcode-proxy-linux-x64",
+    "build:linux-arm64": "bun build --compile --target bun-linux-arm64 --define \"require.resolve=undefined\" src/index.ts --outfile zcode-proxy-linux-arm64"
+  },
+  "dependencies": {
+    "yaml": "^2.5.0",
+    "jsdom": "^25.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/jsdom": "21.1.7",
+    "esbuild": "^0.28.1"
+  }
+}

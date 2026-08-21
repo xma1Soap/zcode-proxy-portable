@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>glm-proxy 多开</title>
+  <style>
+    :root { --bg:#101218; --bar:#171b24; --line:#2a3140; --text:#e8eaef; --muted:#8b93a7; --acc:#6d8cff; --ok:#3dd68c; --bad:#ff6b6b; }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--text); font-family:ui-sans-serif,system-ui,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+    .app { display:flex; flex-direction:column; height:100%; }
+    .bar { flex:0 0 auto; background:var(--bar); border-bottom:1px solid var(--line); padding:8px 10px 0; }
+    .tabs { display:flex; gap:4px; flex-wrap:wrap; align-items:flex-end; }
+    .tab {
+      border:1px solid var(--line); border-bottom:0; background:#12151c; color:var(--text);
+      border-radius:10px 10px 0 0; padding:8px 12px; cursor:pointer; font:inherit;
+    }
+    .tab.active { background:var(--bg); color:#fff; }
+    .tab .dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:6px; background:var(--muted); }
+    .tab .dot.on { background:var(--ok); }
+    .add { border:1px dashed var(--line); background:transparent; color:var(--muted); border-radius:10px 10px 0 0; padding:8px 12px; cursor:pointer; font:inherit; }
+    .tools { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:8px 2px 10px; font-size:13px; color:var(--muted); }
+    .tools input[type=number], .tools input[type=text] { width:88px; background:#101218; border:1px solid var(--line); color:var(--text); border-radius:8px; padding:6px 8px; }
+    .tools input[type=file] { max-width:220px; color:var(--muted); font:inherit; }
+    .tools button { border:1px solid var(--line); background:#101218; color:var(--text); border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit; }
+    .tools button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+    .tools a { color:var(--acc); }
+    .tools label { display:inline-flex; align-items:center; gap:6px; cursor:help; }
+    .stage { flex:1; min-height:0; }
+    iframe { width:100%; height:100%; border:0; background:var(--bg); }
+    .toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:var(--bar); border:1px solid var(--line); padding:8px 14px; border-radius:10px; opacity:0; transition:opacity .2s; pointer-events:none; }
+    .toast.show { opacity:1; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="bar">
+      <div class="tabs" id="tabs"></div>
+      <div class="tools">
+        <span>新开端口</span>
+        <input id="new-port" type="number" min="1" max="65535" />
+        <label title="勾选后，新开的端口用自己的 .credentials-端口 目录，登录和导入互不影响。不勾选则和本窗共用同一份凭证。">
+          <input id="isolated" type="checkbox" checked /> 独立凭证目录
+        </label>
+        <button class="primary" id="btn-add" type="button">开新反代</button>
+        <button id="btn-stop" type="button">停掉当前页</button>
+        <a id="link-web" href="/webui" target="_blank" rel="noreferrer">打开当前 WebUI</a>
+        <span id="hint">每个标签页是一路反代。勾选「独立凭证目录」时登录 / 导入 / 探测互不影响。</span>
+      </div>
+    </div>
+    <div class="stage"><iframe id="frame" title="instance"></iframe></div>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script>
+  (function () {
+    if (window !== window.top) {
+      location.replace("/console");
+      return;
+    }
+    var SELF = __ZCODE_PROXY_PORT_JSON__;
+    var KEY = __ZCODE_PROXY_KEY_JSON__;
+    var active = SELF;
+    var toastTimer;
+    function $(id) { return document.getElementById(id); }
+    function toast(msg) {
+      $("toast").textContent = msg;
+      $("toast").classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () { $("toast").classList.remove("show"); }, 2200);
+    }
+    function headers() {
+      var h = { "content-type": "application/json" };
+      if (KEY) h.authorization = "Bearer " + KEY;
+      return h;
+    }
+    function originFor(port) {
+      return location.protocol + "//" + location.hostname + ":" + port;
+    }
+    function frameSrc(port) {
+      var path = "/console";
+      if (Number(port) === Number(SELF)) return path;
+      return originFor(port) + path;
+    }
+    function show(port) {
+      active = port;
+      $("frame").src = frameSrc(port);
+      $("link-web").href = originFor(port) + "/webui";
+      document.querySelectorAll(".tab").forEach(function (el) {
+        el.classList.toggle("active", Number(el.getAttribute("data-port")) === port);
+      });
+    }
+    function usedPorts(list) {
+      var used = {};
+      (list || []).forEach(function (inst) { used[inst.port] = true; });
+      return used;
+    }
+    function suggestPort(list) {
+      var used = usedPorts(list);
+      var cur = Number($("new-port").value);
+      if (!cur || used[cur]) {
+        var n = Number(SELF) + 1;
+        while (used[n] && n < 65535) n++;
+        $("new-port").value = String(n);
+      }
+    }
+    function render(list) {
+      var tabs = $("tabs");
+      tabs.innerHTML = "";
+      (list || []).forEach(function (inst) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.className = "tab" + (inst.port === active ? " active" : "");
+        b.setAttribute("data-port", String(inst.port));
+        b.innerHTML = '<span class="dot ' + (inst.alive ? "on" : "") + '"></span>:' + inst.port + (inst.self ? " 本窗" : "");
+        b.onclick = function () { show(inst.port); };
+        tabs.appendChild(b);
+      });
+      var add = document.createElement("button");
+      add.type = "button"; add.className = "add"; add.textContent = "+";
+      add.title = "开新反代窗口";
+      add.onclick = startNew;
+      tabs.appendChild(add);
+      suggestPort(list);
+      if (!(list || []).some(function (i) { return i.port === active; })) {
+        show(SELF);
+      } else {
+        $("link-web").href = originFor(active) + "/webui";
+      }
+    }
+    function refresh() {
+      return fetch("/manager/api/list").then(function (r) { return r.json(); }).then(function (j) {
+        render(j.instances || []);
+      }).catch(function (e) { toast(String(e)); });
+    }
+    var starting = false;
+    function startNew() {
+      if (starting) return;
+      var port = Number($("new-port").value);
+      if (!port || port < 1 || port > 65535) { toast("先填有效端口"); $("new-port").focus(); return; }
+      starting = true;
+      toast("正在启动 :" + port + " …");
+      fetch("/manager/api/start", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ port: port, isolated: $("isolated").checked })
+      }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (x) {
+          if (!x.ok) { toast((x.j && x.j.error && x.j.error.message) || "启动失败"); return; }
+          toast("已打开 :" + x.j.instance.port);
+          active = x.j.instance.port;
+          $("new-port").value = String(active + 1);
+          refresh().then(function () { show(active); });
+        }).catch(function (e) { toast(String(e)); })
+        .then(function () { starting = false; });
+    }
+    $("btn-add").onclick = startNew;
+    $("new-port").addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") { ev.preventDefault(); startNew(); }
+    });
+    $("btn-stop").onclick = function () {
+      if (active === SELF) { toast("不能停掉当前这个窗口"); return; }
+      fetch("/manager/api/stop", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ port: active })
+      }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (x) {
+          if (!x.ok) { toast((x.j && x.j.error && x.j.error.message) || "停止失败"); return; }
+          toast("已停止 :" + active);
+          active = SELF;
+          refresh().then(function () { show(SELF); });
+        }).catch(function (e) { toast(String(e)); });
+    };
+    $("new-port").value = String(SELF + 1);
+    show(SELF);
+    refresh();
+    setInterval(refresh, 4000);
+  })();
+  </script>
+</body>
+</html>

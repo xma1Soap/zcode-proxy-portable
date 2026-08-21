@@ -1,0 +1,797 @@
+/**
+ * Main proxy handler — routes requests, injects auth, forwards, and streams responses.
+ *
+ * **Translation mode**:
+ * - coding-plan talks to an OpenAI-compatible upstream. Anthropic clients are
+ *   translated Anthropic → OpenAI → Anthropic.
+ * - start-plan talks to the zcode.z.ai Anthropic gateway only. OpenAI clients
+ *   are translated OpenAI → Anthropic → OpenAI.
+ *
+ * @see .omo/plans/zcode-proxy.md Task 6
+ */
+import type { Format } from "../translator/types.js";
+import type { ProxyConfig } from "../config/types.js";
+import type { AuthManager } from "../auth/manager.js";
+import { getProvider } from "../provider/providers.js";
+import { buildUpstreamHeaderPairs, buildUpstreamRequest, type UpstreamHeaderPair } from "./upstream.js";
+import { sendOrderedUpstreamRequest } from "./ordered-transport.js";
+import { transformRequestBody } from "./body-transformer.js";
+import { type ClientSessionResult } from "./client-session.js";
+import { resolveSessionContext } from "./session-context.js";
+import { gzipSync } from "node:zlib";
+
+// captcha.ts is loaded only on the start-plan path (Edge + CDP, no jsdom).
+type CaptchaModule = typeof import("./captcha.js");
+let captchaModule: CaptchaModule | null = null;
+async function loadCaptcha(): Promise<CaptchaModule> {
+  if (!captchaModule) captchaModule = await import("./captcha.js");
+  return captchaModule;
+}
+import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
+import { translateRequestAnthropicToOpenAI, translateResponseOpenAIToAnthropic } from "../translator/anthropic-to-openai.js";
+import { anthropicSseToOpenaiSse, openaiSseToAnthropicSse } from "../translator/sse-translator.js";
+import type { OpenAIChatRequest, OpenAIChatResponse, AnthropicMessagesRequest, AnthropicMessagesResponse } from "../translator/types.js";
+import { dumpPhase, dumpHeaders, dumpBody, dumpEnabled } from "./dump.js";
+import { recordRequest } from "./runtime-status.js";
+
+/** Options for the proxy handler. */
+export interface ProxyHandlerOptions {
+  config: ProxyConfig;
+  auth: AuthManager;
+  /** Override the global fetch (for testing). Defaults to global `fetch`. */
+  fetchImpl?: typeof fetch;
+  /**
+   * When true, emit additional per-request diagnostic lines: upstream URL,
+   * redacted request headers, body preview, upstream response status and
+   * selected response headers. Activated by `zcode-proxy serve debug`.
+   */
+  debug?: boolean;
+}
+
+/**
+ * Forward a client request to the upstream provider with injected auth.
+ *
+ * Upstream fetch options differ by mode:
+ * - **Passthrough** (OpenAI client): `{ decompress: false }` — compressed
+ *   response bodies (gzip/deflate/br) pass through untouched; raw bytes and the
+ *   Content-Encoding header are forwarded as-is, letting the client decompress.
+ * - **Translation** (Anthropic client): no options — Bun decompresses so the proxy
+ *   can read the body and translate OpenAI→Anthropic (then re-gzip if the client
+ *   accepts).
+ *
+ * No upstream timeout is applied — matches ZCode desktop client behaviour
+ * (the bundle has no automatic timer on LLM calls, only user-initiated abort).
+ * Connection-level errors (ECONNREFUSED, DNS failure) still surface as 502.
+ */
+export async function proxyRequest(
+  clientReq: Request,
+  format: Format,
+  opts: ProxyHandlerOptions,
+): Promise<Response> {
+  const { config, auth } = opts;
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const hasCustomFetchImpl = opts.fetchImpl !== undefined;
+  const debug = opts.debug === true;
+  const started = Date.now();
+  const reqId = nextReqId();
+
+  const body = await readBody(clientReq);
+
+  const meta = peekBody(body);
+
+  if (dumpEnabled()) {
+    dumpPhase(reqId, "client_in", {
+      method: clientReq.method,
+      url: clientReq.url,
+      headers: dumpHeaders(clientReq.headers),
+      body: dumpBody(body),
+    });
+  }
+
+  const staticProvider = getProvider(config.provider);
+  const provider = {
+    ...staticProvider,
+    anthropicBaseURL: config.providers[config.provider].anthropicBase,
+    openaiBaseURL: config.providers[config.provider].openaiBase,
+  };
+
+  let cred;
+  try {
+    cred = await auth.getCredential();
+  } catch (err) {
+    if (debug) debugError(reqId, "credential_unavailable", (err as Error).message);
+    printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
+    return errorResponse(503, "credential_unavailable", (err as Error).message);
+  }
+
+  const startPlan = config.plan === "start-plan";
+  // The start-plan gateway (zcode.z.ai) exposes an Anthropic-format endpoint
+  // ONLY (the OpenAI paths 404). So in start-plan mode the upstream format is
+  // Anthropic: OpenAI clients get translated OpenAI→Anthropic, Anthropic
+  // clients pass through. In coding-plan mode the upstream stays OpenAI
+  // (provider OpenAI-compatible endpoint) and Anthropic clients are translated.
+  const translateAnthropicToOpenAI = !startPlan && format === "anthropic";
+  const translateOpenAIToAnthropic = startPlan && format === "openai";
+  const upstreamFormat: Format = startPlan ? "anthropic" : "openai";
+  const clientSession = resolveSessionContext({ clientReq, body, upstreamFormat, model: meta.model, config });
+  if (debug && clientSession) {
+    const shortSession = clientSession.sessionId ? clientSession.sessionId.slice(0, 10) : "-";
+    debugLine(reqId, `clientIdentity source=${clientSession.source} action=${clientSession.action} confidence=${clientSession.confidence.toFixed(2)} session=${shortSession}`);
+  }
+
+  let upstreamBody = body;
+  if (translateOpenAIToAnthropic) {
+    const translated = translateOpenAIBody(body);
+    if (translated instanceof Response) return translated;
+    upstreamBody = translated;
+    if (debug) debugLine(reqId, `translated OpenAI→Anthropic (bytes=${upstreamBody?.length ?? 0})`);
+  } else if (translateAnthropicToOpenAI) {
+    const translated = translateAnthropicBody(body);
+    if (translated instanceof Response) return translated;
+    upstreamBody = translated;
+    if (debug) debugLine(reqId, `translated Anthropic→OpenAI (bytes=${upstreamBody?.length ?? 0})`);
+  }
+
+  const transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, userId: startPlan ? undefined : cred.userId, startPlan });
+  if (debug && transformedBody !== upstreamBody) {
+    debugLine(reqId, `body transformed (upstreamFormat=${upstreamFormat}, startPlan=${startPlan}, bytes=${transformedBody?.length ?? 0})`);
+  }
+
+  let captchaHeaders: Record<string, string> | undefined;
+  if (startPlan) {
+    try {
+      const captcha = await loadCaptcha();
+      const token = await captcha.getCaptchaToken(config.identity.appVersion);
+      captchaHeaders = { [captcha.RETRY_HEADERS.PARAM]: token.verifyParam, [captcha.RETRY_HEADERS.REGION]: token.region };
+    } catch {
+      // Will solve on 403 fallback below
+    }
+  }
+
+  const useOrderedTransport = shouldUseOrderedTransport(config, clientSession, hasCustomFetchImpl);
+  let upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, captchaHeaders, clientSession);
+  let upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captchaHeaders, clientSession);
+
+  if (debug) {
+    debugLine(reqId, `→ POST ${upstreamReq.url}`);
+    debugLine(reqId, `  ${formatHeaderPairs(upstreamReq.headers)}`);
+    if (transformedBody) debugLine(reqId, `  body preview: ${previewBody(transformedBody)}`);
+  }
+
+  if (dumpEnabled()) {
+    dumpPhase(reqId, "upstream_out", {
+      method: upstreamReq.method,
+      url: upstreamReq.url,
+      headers: dumpHeaders(upstreamReq.headers),
+      body: dumpBody(transformedBody),
+      upstreamFormat,
+      translateMode: translateOpenAIToAnthropic || translateAnthropicToOpenAI,
+      useOrderedTransport,
+      startPlan,
+    });
+  }
+
+  let upstreamResp: Response;
+  try {
+    upstreamResp = await sendUpstreamRequest(upstreamReq, upstreamHeaderPairs, transformedBody, translateOpenAIToAnthropic || translateAnthropicToOpenAI, useOrderedTransport, fetchImpl, clientReq.signal);
+  } catch (err) {
+    if (debug) debugError(reqId, "upstream_unreachable", (err as Error).message);
+    printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
+    return errorResponse(502, "upstream_unreachable", (err as Error).message);
+  }
+  const headersAt = Date.now();
+
+  if (debug) {
+    debugLine(reqId, `← ${upstreamResp.status} ${upstreamResp.statusText}`);
+    debugLine(reqId, `  ${formatResponseHeaders(upstreamResp.headers)}`);
+  }
+
+  if (dumpEnabled()) {
+    dumpPhase(reqId, "upstream_in", {
+      status: upstreamResp.status,
+      statusText: upstreamResp.statusText,
+      headers: dumpHeaders(upstreamResp.headers),
+      isSSE: upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false,
+      ttfbMs: headersAt - started,
+    });
+  }
+
+  if (upstreamResp.status === 401 && startPlan) {
+    if (debug) debugError(reqId, "start_plan_jwt_invalid", "JWT rejected upstream");
+    printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
+    return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
+  }
+
+  // start-plan: on explicit captcha challenge, force re-solve and retry once.
+  // `&& captcha` looks redundant but is required for TS null-narrowing.
+  const captcha = startPlan ? await loadCaptcha() : null;
+  const captchaChallenge = captcha ? captcha.detectCaptchaChallenge(upstreamResp) : null;
+  if (captchaChallenge && captcha) {
+    if (debug) debugLine(reqId, "captcha challenge — re-solving and retrying once");
+    try { upstreamResp.body?.cancel(); } catch {}
+    console.log(`${reqId} captcha challenge, re-solving...`);
+    captcha.invalidateCaptchaToken();
+    try {
+      const fresh = await captcha.getCaptchaToken(config.identity.appVersion);
+      console.log(`${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`);
+      const retryHeaders = {
+        [captcha.RETRY_HEADERS.PARAM]: fresh.verifyParam,
+        [captcha.RETRY_HEADERS.REGION]: fresh.region,
+      };
+      upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, config.plan, retryHeaders, clientSession);
+      upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, retryHeaders, clientSession);
+      upstreamResp = await sendUpstreamRequest(upstreamReq, upstreamHeaderPairs, transformedBody, translateOpenAIToAnthropic || translateAnthropicToOpenAI, useOrderedTransport, fetchImpl, clientReq.signal).catch((err: Error) => {
+        if (debug) debugError(reqId, "upstream_unreachable", err.message);
+        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
+        return errorResponse(502, "upstream_unreachable", err.message);
+      });
+      if (debug) debugLine(reqId, `← retry ${upstreamResp.status} ${upstreamResp.statusText}`);
+    } catch (err) {
+      if (debug) debugError(reqId, "captcha_solver_failed", (err as Error).message);
+      printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
+      return errorResponse(503, "captcha_solver_failed", (err as Error).message);
+    }
+  }
+
+  const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
+
+  if (translateOpenAIToAnthropic) {
+    if (!upstreamResp.ok) {
+      const errBody = await upstreamResp.text().catch(() => "");
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+      return forwardUpstreamError(upstreamResp.status, errBody);
+    }
+    if (isSSE && upstreamResp.body) {
+      const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
+      const [clientBody, statsBody] = translated.tee();
+      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null);
+      return translatedSseResponse(clientBody);
+    }
+    return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt);
+  }
+
+  if (translateAnthropicToOpenAI) {
+    if (!upstreamResp.ok) {
+      const errBody = await upstreamResp.text().catch(() => "");
+      printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+      return forwardUpstreamError(upstreamResp.status, errBody);
+    }
+    if (isSSE && upstreamResp.body) {
+      const translated = openaiSseToAnthropicSse(upstreamResp.body, meta.model);
+      const [clientBody, statsBody] = translated.tee();
+      observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null);
+      return translatedSseResponse(clientBody);
+    }
+    return await translatedOpenAIToAnthropicBatchResponse(clientReq, upstreamResp, reqId, format, meta, started, headersAt);
+  }
+
+  if (isSSE && upstreamResp.body) {
+    const [clientBody, statsBody] = upstreamResp.body.tee();
+    observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, upstreamResp.headers.get("content-encoding"));
+    return passthroughResponse(upstreamResp, clientAcceptsGzip(clientReq), clientBody);
+  }
+
+  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+  return passthroughResponse(upstreamResp, clientAcceptsGzip(clientReq));
+}
+
+export function shouldUseOrderedTransport(config: ProxyConfig, clientSession: ClientSessionResult | undefined, hasCustomFetchImpl: boolean): boolean {
+  if (hasCustomFetchImpl) return false;
+  return clientSession?.action === "enforce" || clientSession?.source === "explicit";
+}
+
+async function sendUpstreamRequest(
+  upstreamReq: Request,
+  headerPairs: UpstreamHeaderPair[],
+  body: string | undefined,
+  translateMode: boolean,
+  useOrderedTransport: boolean,
+  fetchImpl: typeof fetch,
+  abortSignal?: AbortSignal,
+): Promise<Response> {
+  if (useOrderedTransport) {
+    return sendOrderedUpstreamRequest({
+      url: upstreamReq.url,
+      method: upstreamReq.method,
+      headers: headerPairs,
+      body,
+      decompress: translateMode,
+    });
+  }
+  const fetchOpts: RequestInit & { decompress?: boolean } = translateMode ? {} : { decompress: false };
+  if (abortSignal) fetchOpts.signal = abortSignal;
+  return fetchImpl(upstreamReq, fetchOpts);
+}
+
+/** Read the request body as a string, returning undefined for empty bodies. */
+async function readBody(req: Request): Promise<string | undefined> {
+  if (req.method === "GET" || req.method === "HEAD") return undefined;
+  const text = await req.text();
+  if (text.length === 0) return undefined;
+  return text;
+}
+
+/**
+ * Create a passthrough response that streams the upstream body to the client.
+ * Preserves status and the allowlisted headers, and honors the client's
+ * `Accept-Encoding` for gzip.
+ *
+ * The upstream request always advertises `accept-encoding: gzip` (see
+ * `buildUpstreamHeaderPairs`), so the upstream typically returns a gzip body.
+ * If THIS client did not advertise gzip, we decompress before forwarding and
+ * drop the now-mismatched `content-encoding`/`content-length` headers —
+ * otherwise clients whose HTTP stack does not auto-decompress (e.g. some
+ * Tauri-based clients) receive raw gzip bytes and fail to parse the JSON
+ * body with "non-JSON body" errors despite a 200 status.
+ */
+function passthroughResponse(
+  upstream: Response,
+  clientAcceptsGzip: boolean,
+  body?: ReadableStream<Uint8Array>,
+): Response {
+  const headers = new Headers();
+  const forwardHeaders = [
+    "content-type",
+    "content-encoding",
+    "cache-control",
+    "x-request-id",
+    "anthropic-ratelimit-requests-limit",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-limit",
+    "anthropic-ratelimit-tokens-remaining",
+    "anthropic-ratelimit-tokens-reset",
+  ];
+
+  for (const h of forwardHeaders) {
+    const v = upstream.headers.get(h);
+    if (v) headers.set(h, v);
+  }
+
+  const upstreamEncoding = headers.get("content-encoding")?.toLowerCase() ?? "";
+  const source = body ?? upstream.body;
+  if (upstreamEncoding.includes("gzip") && !clientAcceptsGzip && source) {
+    const gunzip = new DecompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>;
+    const decompressed = source.pipeThrough(gunzip);
+    headers.delete("content-encoding");
+    headers.delete("content-length");
+    return new Response(decompressed, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers,
+    });
+  }
+
+  return new Response(source, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers,
+  });
+}
+
+/** Build a JSON error response. */
+export function errorResponse(status: number, type: string, message: string): Response {
+  const body = JSON.stringify({
+    error: { type, message },
+  });
+  return new Response(body, {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** Keep the upstream status/body so clients see 400/403/429 instead of a 502 wrap. */
+export function forwardUpstreamError(status: number, errBody: string): Response {
+  const trimmed = errBody.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return new Response(trimmed, {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  return errorResponse(status, "upstream_error", trimmed || `upstream returned ${status}`);
+}
+
+/** Translate an OpenAI request body string to Anthropic JSON. Returns error Response on failure. */
+function translateOpenAIBody(body: string | undefined): Response | string | undefined {
+  if (body === undefined || body.length === 0) {
+    return errorResponse(400, "translation_failed", "OpenAI request body is empty; cannot translate.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch (err) {
+    return errorResponse(400, "translation_failed", `OpenAI request body is not valid JSON: ${(err as Error).message}`);
+  }
+  try {
+    const translated = translateRequestOpenAIToAnthropic(parsed as OpenAIChatRequest);
+    return JSON.stringify(translated);
+  } catch (err) {
+    return errorResponse(400, "translation_failed", `OpenAI→Anthropic translation failed: ${(err as Error).message}`);
+  }
+}
+
+/** True when the client request explicitly accepts gzip (and has not disabled it via q=0). */
+function clientAcceptsGzip(req: Request): boolean {
+  const ae = req.headers.get("accept-encoding");
+  if (!ae) return false;
+  return /\bgzip\b(?!\s*;\s*q=0(?:\.0+)?\s*(?:,|$))/i.test(ae);
+}
+
+/** Build a translated batch (non-streaming) OpenAI response. Gzip if client accepts. */
+async function translatedBatchResponse(
+  clientReq: Request,
+  upstream: Response,
+  model: string,
+  reqId: string,
+  format: Format,
+  meta: RequestMeta,
+  started: number,
+  headersAt: number,
+): Promise<Response> {
+  const raw = await upstream.text();
+  let parsedAnthropic: AnthropicMessagesResponse;
+  try {
+    parsedAnthropic = JSON.parse(raw) as AnthropicMessagesResponse;
+  } catch (err) {
+    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+    return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
+  }
+  if (!isAnthropicMessagesResponse(parsedAnthropic)) {
+    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+    return errorResponse(502, "translation_failed", `upstream returned invalid Anthropic message: ${raw.slice(0, 200)}`);
+  }
+  const openaiResp = translateResponseAnthropicToOpenAI(parsedAnthropic, model);
+  const json = JSON.stringify(openaiResp);
+  const payload = new TextEncoder().encode(json);
+
+  const respHeaders = new Headers();
+  respHeaders.set("content-type", "application/json");
+  for (const h of forwardedUpstreamHeaders()) {
+    const v = upstream.headers.get(h);
+    if (v) respHeaders.set(h, v);
+  }
+
+  if (clientAcceptsGzip(clientReq)) {
+    respHeaders.set("content-encoding", "gzip");
+    printRow(reqId, format, meta, upstream.status, started, headersAt, openaiResp.usage?.completion_tokens ?? 0, 0, 0);
+    return new Response(gzipSync(payload), {
+      status: upstream.status,
+      headers: respHeaders,
+    });
+  }
+  printRow(reqId, format, meta, upstream.status, started, headersAt, openaiResp.usage?.completion_tokens ?? 0, 0, 0);
+  return new Response(payload, {
+    status: upstream.status,
+    headers: respHeaders,
+  });
+}
+
+async function translatedOpenAIToAnthropicBatchResponse(
+  clientReq: Request,
+  upstream: Response,
+  reqId: string,
+  format: Format,
+  meta: RequestMeta,
+  started: number,
+  headersAt: number,
+): Promise<Response> {
+  const raw = await upstream.text();
+  let parsedOpenAI: OpenAIChatResponse;
+  try {
+    parsedOpenAI = JSON.parse(raw) as OpenAIChatResponse;
+  } catch (err) {
+    printRow(reqId, format, meta, 502, started, headersAt, 0, 0, 0);
+    return errorResponse(502, "translation_failed", `upstream returned non-JSON body: ${(err as Error).message}`);
+  }
+  const anthropicResp = translateResponseOpenAIToAnthropic(parsedOpenAI);
+  const json = JSON.stringify(anthropicResp);
+  const payload = new TextEncoder().encode(json);
+
+  const respHeaders = new Headers();
+  respHeaders.set("content-type", "application/json");
+  for (const h of forwardedUpstreamHeaders()) {
+    const v = upstream.headers.get(h);
+    if (v) respHeaders.set(h, v);
+  }
+
+  if (clientAcceptsGzip(clientReq)) {
+    respHeaders.set("content-encoding", "gzip");
+    printRow(reqId, format, meta, upstream.status, started, headersAt, anthropicResp.usage.output_tokens, 0, 0);
+    return new Response(gzipSync(payload), {
+      status: upstream.status,
+      headers: respHeaders,
+    });
+  }
+  printRow(reqId, format, meta, upstream.status, started, headersAt, anthropicResp.usage.output_tokens, 0, 0);
+  return new Response(payload, {
+    status: upstream.status,
+    headers: respHeaders,
+  });
+}
+
+function translateAnthropicBody(body: string | undefined): Response | string | undefined {
+  if (body === undefined || body.length === 0) {
+    return errorResponse(400, "translation_failed", "Anthropic request body is empty; cannot translate.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch (err) {
+    return errorResponse(400, "translation_failed", `Anthropic request body is not valid JSON: ${(err as Error).message}`);
+  }
+  try {
+    const translated = translateRequestAnthropicToOpenAI(parsed as AnthropicMessagesRequest);
+    return JSON.stringify(translated);
+  } catch (err) {
+    return errorResponse(400, "translation_failed", `Anthropic→OpenAI translation failed: ${(err as Error).message}`);
+  }
+}
+
+function isAnthropicMessagesResponse(value: unknown): value is AnthropicMessagesResponse {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<AnthropicMessagesResponse>;
+  return candidate.type === "message" && candidate.role === "assistant" && Array.isArray(candidate.content);
+}
+
+function forwardedUpstreamHeaders(): string[] {
+  return [
+    "x-request-id",
+    "anthropic-ratelimit-requests-limit",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-limit",
+    "anthropic-ratelimit-tokens-remaining",
+    "anthropic-ratelimit-tokens-reset",
+  ];
+}
+
+function translatedSseResponse(body: ReadableStream<Uint8Array>): Response {
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+    },
+  });
+}
+
+interface RequestMeta {
+  model: string;
+  stream: boolean;
+}
+
+function peekBody(body: string | undefined): RequestMeta {
+  if (!body) return { model: "-", stream: false };
+  try {
+    const p = JSON.parse(body) as Record<string, unknown>;
+    return {
+      model: typeof p.model === "string" ? p.model : "-",
+      stream: p.stream === true,
+    };
+  } catch {
+    return { model: "-", stream: false };
+  }
+}
+
+let reqCounter = 0;
+let headerPrinted = false;
+
+/** Format a unix-ms timestamp as local HH:MM:SS in the host's timezone (not UTC). */
+function localTime(ms: number): string {
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+function nextReqId(): string {
+  return `#${String(++reqCounter).padStart(3, "0")}`;
+}
+
+const DEBUG_BODY_PREVIEW = 200;
+const SENSITIVE_HEADERS = new Set(["authorization", "x-api-key", "cookie", "set-cookie", "proxy-authorization"]);
+
+function debugLine(reqId: string, msg: string): void {
+  console.log(`${reqId} debug: ${msg}`);
+}
+
+function debugError(reqId: string, kind: string, msg: string): void {
+  console.log(`${reqId} debug: ERROR ${kind}: ${msg}`);
+}
+
+function redactHeaderVal(key: string, val: string): string {
+  const k = key.toLowerCase();
+  if (!SENSITIVE_HEADERS.has(k)) return val;
+  if (k === "authorization") {
+    const sp = val.indexOf(" ");
+    return sp > 0 ? `${val.slice(0, sp)} <redacted>` : "<redacted>";
+  }
+  if (val.length <= 10) return "<redacted>";
+  return `${val.slice(0, 6)}...${val.slice(-4)}`;
+}
+
+function formatHeaderPairs(headers: Headers): string {
+  const pairs: string[] = [];
+  for (const [k, v] of headers.entries()) {
+    pairs.push(`${k}=${redactHeaderVal(k, v)}`);
+  }
+  return pairs.join(" ");
+}
+
+function formatResponseHeaders(headers: Headers): string {
+  const interesting = [
+    "content-type",
+    "content-encoding",
+    "content-length",
+    "x-request-id",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-tokens-remaining",
+  ];
+  const pairs: string[] = [];
+  for (const h of interesting) {
+    const v = headers.get(h);
+    if (v) pairs.push(`${h}=${v}`);
+  }
+  return pairs.length > 0 ? pairs.join(" ") : "(no notable headers)";
+}
+
+function previewBody(body: string): string {
+  const flat = body.replace(/\s+/g, " ").trim();
+  if (flat.length <= DEBUG_BODY_PREVIEW) return flat;
+  return `${flat.slice(0, DEBUG_BODY_PREVIEW)}…(${flat.length} bytes total)`;
+}
+
+const COMPACT_LOG = process.env.ZCODE_LOG_FORMAT === "compact";
+
+function printHeader(): void {
+  if (headerPrinted) return;
+  headerPrinted = true;
+  if (COMPACT_LOG) return;
+  console.log(
+    "| #    | Time       | Fmt | Model       | Mode   | Stat |    TTFB |   Tok |  tok/s |   Total |",
+  );
+  console.log(
+    "|------|------------|-----|-------------|--------|------|---------|-------|--------|---------|",
+  );
+}
+
+function printRow(
+  reqId: string,
+  format: Format,
+  meta: RequestMeta,
+  status: number,
+  started: number,
+  headersAt: number,
+  tokens: number,
+  avgTps: number,
+  streamEndAt: number,
+): void {
+  printHeader();
+  recordRequest({
+    id: reqId,
+    at: started,
+    format,
+    model: meta.model,
+    status,
+    ttfbMs: Math.max(0, headersAt - started),
+    tokens,
+  });
+  const tag = format === "anthropic" ? "ANT" : "OAI";
+  const mode = meta.stream ? "stream" : "batch";
+
+  if (COMPACT_LOG) {
+    const ttfbMs = headersAt - started;
+    const totalMs = streamEndAt > started ? streamEndAt - started : ttfbMs;
+    const ttfbStr = fmtMs(ttfbMs);
+    const tokStr = tokens > 0 ? `${tokens}tok` : "";
+    const tpsStr = avgTps > 0 ? `${avgTps.toFixed(0)}t/s` : "";
+    const parts = [reqId, tag, meta.model, String(status), mode];
+    if (meta.stream && streamEndAt > started) {
+      parts.push(`${ttfbStr}→${fmtMs(totalMs)}`);
+    } else {
+      parts.push(ttfbStr);
+    }
+    if (tokStr) parts.push(tokStr);
+    if (tpsStr) parts.push(tpsStr);
+    console.log(parts.join(" "));
+    return;
+  }
+
+  const ts = localTime(started);
+  const ttfb = `${headersAt - started}ms`;
+  const total = streamEndAt > started ? `${streamEndAt - started}ms` : "-";
+  const tok = tokens > 0 ? String(tokens) : "-";
+  const tps = avgTps > 0 ? avgTps.toFixed(1) : "-";
+  console.log(
+    `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
+  );
+}
+
+function fmtMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60_000)}m${Math.floor((ms % 60_000) / 1000)}s`;
+}
+
+function observeStream(
+  reqId: string,
+  format: Format,
+  meta: RequestMeta,
+  status: number,
+  requestSentAt: number,
+  body: ReadableStream<Uint8Array>,
+  contentEncoding: string | null,
+): void {
+  const compressed = contentEncoding !== null;
+  const dumpOn = dumpEnabled();
+  let tokens = 0;
+  let sseBuffer = "";
+  let firstChunkAt = 0;
+  let totalBytes = 0;
+  let firstBytesSample = "";
+
+  function parseSse(text: string): void {
+    for (const line of text.split("\n")) {
+      if (!line.startsWith("data:") || line.includes("[DONE]")) continue;
+      try {
+        const j = JSON.parse(line.slice(5).trim());
+        if (j.usage?.completion_tokens) { tokens = j.usage.completion_tokens; continue; }
+        if (j.usage?.output_tokens) { tokens = j.usage.output_tokens; continue; }
+        // OpenAI content delta: choices[0].delta.content
+        const oai = j.choices?.[0]?.delta?.content;
+        if (typeof oai === "string" && oai.length > 0) { tokens++; continue; }
+        // Anthropic content delta: type=content_block_delta, delta.type=text_delta
+        if (j.type === "content_block_delta" && j.delta?.type === "text_delta") {
+          const t = j.delta?.text;
+          if (typeof t === "string" && t.length > 0) tokens++;
+        }
+      } catch {}
+    }
+  }
+
+  (async () => {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (firstChunkAt === 0) firstChunkAt = Date.now();
+        if (dumpOn && value) {
+          totalBytes += value.byteLength;
+          if (firstBytesSample.length < 4096) {
+            firstBytesSample += decoder.decode(value.slice(0, 4096 - firstBytesSample.length), { stream: true });
+          }
+        }
+        if (!compressed) {
+          sseBuffer += decoder.decode(value, { stream: true });
+          const idx = sseBuffer.lastIndexOf("\n");
+          if (idx >= 0) {
+            parseSse(sseBuffer.slice(0, idx));
+            sseBuffer = sseBuffer.slice(idx + 1);
+          }
+        }
+      }
+      if (!compressed && sseBuffer) parseSse(sseBuffer);
+    } catch {}
+    const endAt = Date.now();
+    const ttfbMs = (firstChunkAt > 0 ? firstChunkAt : endAt) - requestSentAt;
+    const totalMs = endAt - requestSentAt;
+    const avgTps = tokens > 0 && totalMs > 0 ? tokens / (totalMs / 1000) : 0;
+    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt);
+    if (dumpOn) {
+      dumpPhase(reqId, "upstream_stream_summary", {
+        status,
+        contentEncoding,
+        compressed,
+        totalBytes,
+        tokensObserved: tokens,
+        ttfbMs,
+        totalMs,
+        firstBytesSample: firstBytesSample.length > 0 ? firstBytesSample.slice(0, 4096) : "(empty stream)",
+      });
+    }
+  })().catch(() => {});
+}
