@@ -52,7 +52,7 @@ describe("translateRequestOpenAIToAnthropic", () => {
       messages: [{ role: "user", content: "Hi" }],
     };
     const result = translateRequestOpenAIToAnthropic(req);
-    expect(result.max_tokens).toBe(20000);
+    expect(result.max_tokens).toBe(128000);
   });
 
   it("preserves max_tokens when provided", () => {
