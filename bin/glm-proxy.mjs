@@ -11,7 +11,7 @@ import https from "node:https";
 
 const HOME = process.env.GLM_PROXY_HOME || join(homedir(), ".glm-proxy-coexist");
 const RELEASE = process.env.GLM_PROXY_RELEASE
-  || "https://github.com/xma1Soap/zcode-proxy-portable/releases/download/v3";
+  || "https://github.com/xma1Soap/zcode-proxy-portable/releases/download/v4";
 
 function die(msg, code = 1) {
   process.stderr.write(msg + "\n");

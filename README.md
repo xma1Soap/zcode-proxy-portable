@@ -29,7 +29,7 @@ npm install github:xma1Soap/zcode-proxy-portable#glm-proxy
 npx glm-proxy start 8082
 ```
 
-First `start` downloads the Linux prebuild from release `v3` into `~/.glm-proxy-coexist/`.  
+First `start` downloads the Linux prebuild from release `v4` into `~/.glm-proxy-coexist/`.  
 WebUI: `http://127.0.0.1:<port>/webui`
 
 ```bash

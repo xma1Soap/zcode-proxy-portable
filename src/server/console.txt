@@ -84,6 +84,31 @@
     .chips { display: flex; flex-wrap: wrap; gap: 6px; }
     .chip { background: var(--card2); border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px; font-size: 12px; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .dd { position: relative; min-width: 168px; }
+    .dd-btn {
+      width: 100%; justify-content: space-between;
+      background: var(--card2); border: 1px solid var(--line); color: var(--text);
+      border-radius: 10px; padding: 8px 12px;
+    }
+    .dd-btn:hover, .dd.open .dd-btn { border-color: var(--accent); }
+    .dd-btn .caret {
+      width: 0; height: 0; margin-left: 10px;
+      border-left: 5px solid transparent; border-right: 5px solid transparent;
+      border-top: 6px solid var(--muted);
+    }
+    .dd.open .dd-btn .caret { border-top: 0; border-bottom: 6px solid var(--accent); }
+    .dd-menu {
+      display: none; position: absolute; left: 0; right: 0; top: calc(100% + 6px);
+      background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+      box-shadow: var(--shadow); padding: 6px; z-index: 20;
+    }
+    .dd.open .dd-menu { display: block; }
+    .dd-item {
+      display: block; width: 100%; text-align: left; border: 0; background: transparent;
+      color: var(--text); border-radius: 8px; padding: 8px 10px; cursor: pointer; font: inherit;
+    }
+    .dd-item:hover { background: rgba(109,139,255,.16); }
+    .dd-item.active { color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2)); }
     .hint { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.5; }
     .toast {
       position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
@@ -100,7 +125,6 @@
         <div class="logo"></div>
         <div>
           <h1>glm-proxy</h1>
-          <div class="sub">可视化控制台 · 登录 / 状态 / 接入</div>
         </div>
       </div>
       <div class="nav">
@@ -132,8 +156,11 @@
         <h3>快速对话</h3>
         <div class="meta">完整聊天在「打开对话」。这里发一条最短探测。</div>
         <div class="actions">
-          <select id="probe-model"></select>
-          <button class="primary" id="btn-probe" type="button">测试</button>
+          <div class="dd" id="probe-dd">
+            <button class="dd-btn" id="probe-dd-btn" type="button"><span id="probe-dd-label">glm-5.3</span><span class="caret"></span></button>
+            <div class="dd-menu" id="probe-dd-menu"></div>
+          </div>
+          <button class="primary" id="btn-probe" type="button">启动浏览器并测试</button>
         </div>
         <div class="hint mono" id="probe-out">尚未测试</div>
       </div>
@@ -192,27 +219,44 @@
     function setPulse(kind) {
       $("pulse").className = "pulse " + (kind || "");
     }
+    var probeModel = "glm-5.3";
+    function setProbeModel(id) {
+      probeModel = id;
+      $("probe-dd-label").textContent = id;
+      var menu = $("probe-dd-menu");
+      Array.prototype.forEach.call(menu.children, function (el) {
+        el.classList.toggle("active", el.getAttribute("data-id") === id);
+      });
+    }
     function fillModels(list) {
       var box = $("box-models");
-      var sel = $("probe-model");
-      var keep = sel.value;
+      var menu = $("probe-dd-menu");
+      var keep = probeModel;
       var ids = list || [];
-      var same = sel.options.length === ids.length;
+      var same = menu.children.length === ids.length;
       if (same) {
         for (var i = 0; i < ids.length; i++) {
-          if (sel.options[i].value !== ids[i]) { same = false; break; }
+          if (menu.children[i].getAttribute("data-id") !== ids[i]) { same = false; break; }
         }
       }
       if (same) return;
       box.innerHTML = "";
-      sel.innerHTML = "";
+      menu.innerHTML = "";
       ids.forEach(function (id) {
         var c = document.createElement("span");
         c.className = "chip"; c.textContent = id; box.appendChild(c);
-        var o = document.createElement("option"); o.value = id; o.textContent = id; sel.appendChild(o);
+        var o = document.createElement("button");
+        o.type = "button"; o.className = "dd-item"; o.setAttribute("data-id", id); o.textContent = id;
+        o.onclick = function (ev) {
+          ev.stopPropagation();
+          setProbeModel(id);
+          $("probe-dd").classList.remove("open");
+        };
+        menu.appendChild(o);
       });
-      if (keep && ids.indexOf(keep) >= 0) sel.value = keep;
-      else if (ids.indexOf("glm-5.3") >= 0) sel.value = "glm-5.3";
+      if (keep && ids.indexOf(keep) >= 0) setProbeModel(keep);
+      else if (ids.indexOf("glm-5.3") >= 0) setProbeModel("glm-5.3");
+      else if (ids[0]) setProbeModel(ids[0]);
     }
     function renderAuth(a) {
       if (!a) return;
@@ -295,7 +339,7 @@
         .catch(function (e) { toast(String(e)); });
     }
     function probe() {
-      var model = $("probe-model").value || "glm-5.3";
+      var model = probeModel || "glm-5.3";
       $("probe-out").textContent = "请求 " + model + " …";
       var headers = { "content-type": "application/json" };
       if (SERVER_KEY) headers.authorization = "Bearer " + SERVER_KEY;
@@ -374,6 +418,13 @@
     $("btn-import-cred").onclick = importCredFile;
     $("btn-logout").onclick = logout;
     $("btn-probe").onclick = probe;
+    $("probe-dd-btn").onclick = function (ev) {
+      ev.stopPropagation();
+      $("probe-dd").classList.toggle("open");
+    };
+    document.addEventListener("click", function () {
+      $("probe-dd").classList.remove("open");
+    });
     $("box-base").textContent = origin() + "/v1";
     $("box-ant").textContent = origin();
     $("box-web").textContent = origin() + "/webui";

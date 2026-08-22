@@ -268,12 +268,15 @@ describe("web UI", () => {
     const resp = await handler(new Request("http://localhost/console", { method: "GET" }));
     expect(resp.status).toBe(200);
     const body = await resp.text();
-    expect(body).toContain("可视化控制台");
+    expect(body).not.toContain("可视化控制台 · 登录 / 状态 / 接入");
     expect(body).toContain("登录 Bigmodel");
     expect(body).toContain("从 ZCode 导入");
     expect(body).toContain("导出解密凭证");
     expect(body).toContain("导入解密凭证");
-    expect(body).toContain(">测试<");
+    expect(body).toContain("启动浏览器并测试");
+    expect(body).not.toContain(">测试<");
+    expect(body).toContain("probe-dd");
+    expect(body).not.toContain("id=\"probe-model\"");
     expect(body).not.toContain("主题");
     expect(body).not.toContain("复制 Base URL");
     expect(body).not.toContain("复制 Key");

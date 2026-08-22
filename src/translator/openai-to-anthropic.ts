@@ -17,7 +17,7 @@ import type {
 import { MODELS } from "../provider/models.js";
 
 /** Default max_tokens if the OpenAI request doesn't specify one. */
-const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_MAX_TOKENS = 20000;
 
 /** Translate an OpenAI chat request into an Anthropic messages request. */
 export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): AnthropicMessagesRequest {

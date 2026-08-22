@@ -476,7 +476,7 @@
         systemPrompt: "",
         temperature: 1.0,
         topP: 0.95,
-        maxTokens: 4096,
+        maxTokens: 20000,
         doSample: true,
         thinkingEnabled: true,
         reasoningEffort: "max",
@@ -1431,7 +1431,7 @@
         s.systemPrompt = $("s-system").value;
         s.temperature = parseFloat($("s-temp").value);
         s.topP = parseFloat($("s-topp").value);
-        s.maxTokens = parseInt($("s-maxtok").value, 10) || 4096;
+        s.maxTokens = parseInt($("s-maxtok").value, 10) || 20000;
         s.doSample = $("s-dosample").checked;
         s.mcpEnabled = $("s-mcpenable").checked;
         s.mcpServers = $("s-mcp").value.split("\n").map(function (ln) {
